@@ -197,14 +197,10 @@ class ModelAndPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(worker.WorkerError, "on PATH"):
                     worker.claude_path()
 
-    def test_selective_migration_keeps_rejected_replacement_cancelled(self) -> None:
-        value = {"worker_id": next(iter(worker.PERMANENTLY_CANCELLED)), "state": "stopped", "result_disposition": "pending"}
-        migrated, changed = worker._migrate_manifest(value)
-        self.assertTrue(changed)
-        self.assertEqual(migrated["state"], "cancelled")
-        self.assertEqual(migrated["result_disposition"], "cancelled")
+    def test_migration_uses_manifest_state_not_session_specific_ids(self) -> None:
         legacy = {"worker_id": "cw-legacy", "state": "stopped"}
-        migrated, _ = worker._migrate_manifest(legacy)
+        migrated, changed = worker._migrate_manifest(legacy)
+        self.assertTrue(changed)
         self.assertEqual(migrated["state"], "cold_paused")
         rejected = {"worker_id": "cw-rejected", "state": "stopped", "result_disposition": "rejected"}
         migrated, _ = worker._migrate_manifest(rejected)
@@ -266,6 +262,41 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertFalse(value["human_ceiling"]["binding"])
         self.assertNotIn("human_ceiling", value["gates"])
 
+    def test_resume_capacity_excludes_the_reactivating_worker(self) -> None:
+        snapshot = {
+            "performance_cores": 12,
+            "logical_cores": 16,
+            "total_memory_bytes": 128 * 1024**3,
+            "available_memory_bytes": 100 * 1024**3,
+            "load1": 2.0,
+            "load5": 2.0,
+            "load15": 2.0,
+            "disk_free_bytes": 200 * 1024**3,
+        }
+        manifests = [
+            {"worker_id": "cw-reactivating", "state": "capacity_wait", "workload": "standard"},
+            {"worker_id": "cw-other", "state": "running", "workload": "standard"},
+        ]
+        with mock.patch.object(worker, "all_manifests", return_value=manifests):
+            included = worker.calculate_capacity(
+                snapshot,
+                native_active=0,
+                workload="standard",
+                max_total_worker_lanes=2,
+            )
+            excluded = worker.calculate_capacity(
+                snapshot,
+                native_active=0,
+                workload="standard",
+                max_total_worker_lanes=2,
+                excluded_claude_worker_id="cw-reactivating",
+            )
+        self.assertEqual(included["current_count"], 2)
+        self.assertEqual(included["safe_additional_this_wave"], 0)
+        self.assertEqual(excluded["current_count"], 1)
+        self.assertEqual(excluded["safe_additional_this_wave"], 1)
+        self.assertEqual(excluded["excluded_claude_worker_id"], "cw-reactivating")
+
     def test_total_worker_lane_ceiling_reports_arithmetic_and_binding(self) -> None:
         snapshot = {
             "performance_cores": 12,
@@ -299,12 +330,52 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertFalse(receipt["primary_codex_included"])
         self.assertTrue(receipt["binding"])
         self.assertTrue(receipt["reduced_capacity"])
+        self.assertEqual(constrained["limits"]["human_ceiling"], 0)
         self.assertEqual(constrained["safe_additional_this_wave"], 0)
         self.assertIn("human_ceiling", constrained["gates"])
         self.assertEqual(unconstrained["safe_additional_this_wave"], 2)
         self.assertFalse(unconstrained["human_ceiling"]["binding"])
         self.assertFalse(unconstrained["human_ceiling"]["reduced_capacity"])
         self.assertNotIn("human_ceiling", unconstrained["gates"])
+
+    def test_total_worker_lane_ceiling_boundary_zero_and_over_capacity(self) -> None:
+        snapshot = {
+            "performance_cores": 12,
+            "logical_cores": 16,
+            "total_memory_bytes": 128 * 1024**3,
+            "available_memory_bytes": 100 * 1024**3,
+            "load1": 2.0,
+            "load5": 2.0,
+            "load15": 2.0,
+            "disk_free_bytes": 200 * 1024**3,
+        }
+        with mock.patch.object(worker, "active_claude_weight", return_value=(1.0, 1)):
+            boundary = worker.calculate_capacity(
+                snapshot,
+                native_active=3,
+                workload="standard",
+                max_total_worker_lanes=6,
+            )
+            over_capacity = worker.calculate_capacity(
+                snapshot,
+                native_active=3,
+                workload="standard",
+                max_total_worker_lanes=3,
+            )
+            zero = worker.calculate_capacity(
+                snapshot,
+                native_active=3,
+                workload="standard",
+                max_total_worker_lanes=0,
+            )
+        self.assertEqual(boundary["human_ceiling"]["remaining_capacity"], 2)
+        self.assertTrue(boundary["human_ceiling"]["binding"])
+        self.assertFalse(boundary["human_ceiling"]["reduced_capacity"])
+        self.assertIn("human_ceiling", boundary["gates"])
+        for value, supplied in ((over_capacity, 3), (zero, 0)):
+            self.assertEqual(value["human_ceiling"]["supplied_max_total_worker_lanes"], supplied)
+            self.assertEqual(value["human_ceiling"]["remaining_capacity"], 0)
+            self.assertEqual(value["safe_additional_this_wave"], 0)
 
     def test_total_worker_lane_ceiling_flag_and_deprecated_alias(self) -> None:
         parser = worker.build_parser()
@@ -313,9 +384,26 @@ class ModelAndPolicyTests(unittest.TestCase):
         legacy = parser.parse_args(base + ["--max-workers", "6"])
         self.assertEqual(current.max_total_worker_lanes, 6)
         self.assertEqual(legacy.max_total_worker_lanes, 6)
+        self.assertFalse(current.deprecated_max_workers_used)
+        self.assertTrue(legacy.deprecated_max_workers_used)
+        self.assertEqual(parser.parse_args(base + ["--max-total-worker-lanes", "0"]).max_total_worker_lanes, 0)
         with mock.patch("sys.stderr", new=io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(base + ["--max-total-worker-lanes", "6", "--max-workers", "6"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["capacity", "--cwd", "/tmp", "--native-active", "-1"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args([
+                    "spawn",
+                    "--cwd", "/tmp",
+                    "--activation", "explicit-claude",
+                    "--native-active", "0",
+                    "--native-free-slots", "-1",
+                    "--codex-approval-policy", "never",
+                    "--codex-sandbox", "read-only",
+                    "--network", "disabled",
+                    "--name", "negative",
+                ])
         with self.assertRaises(argparse.ArgumentTypeError):
             worker.nonnegative_int("-1")
         help_result = subprocess.run(
@@ -328,6 +416,45 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertIn("combined active native Codex", normalized_help)
         self.assertIn("excludes the primary Codex orchestrator", normalized_help)
         self.assertIn("deprecated alias for --max-total-worker-lanes", normalized_help)
+
+    def test_deprecated_alias_is_reported_in_capacity_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = dict(os.environ)
+            env["CLAUDE_WORKER_STATE_DIR"] = temp
+            legacy = subprocess.run(
+                [
+                    sys.executable,
+                    str(WORKER_CLI),
+                    "capacity",
+                    "--cwd", "/tmp",
+                    "--native-active", "0",
+                    "--max-workers", "99",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            current = subprocess.run(
+                [
+                    sys.executable,
+                    str(WORKER_CLI),
+                    "capacity",
+                    "--cwd", "/tmp",
+                    "--native-active", "0",
+                    "--max-total-worker-lanes", "99",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+        self.assertIn(legacy.returncode, (0, 3), legacy.stderr)
+        self.assertIn(current.returncode, (0, 3), current.stderr)
+        legacy_receipt = json.loads(legacy.stdout)
+        current_receipt = json.loads(current.stdout)
+        self.assertTrue(legacy_receipt["deprecated_alias_used"])
+        self.assertIn(worker.DEPRECATED_MAX_WORKERS_NOTICE, legacy_receipt["notices"])
+        self.assertFalse(current_receipt["deprecated_alias_used"])
+        self.assertEqual(current_receipt["notices"], [])
 
 
 class HookTests(unittest.TestCase):
@@ -523,10 +650,39 @@ for line in sys.stdin:
         )
         self.assertFalse(completed["orchestration_policy"]["overflow_mode"])
         self.assertEqual(completed["orchestration_policy"]["primary_codex_role_default"], "orchestrator_or_worker")
+        capacity_receipt = completed["capacity_at_spawn"]
+        self.assertEqual(capacity_receipt["human_ceiling"]["supplied_max_total_worker_lanes"], 1)
+        self.assertEqual(capacity_receipt["human_ceiling"]["current_count"], 0)
+        self.assertEqual(capacity_receipt["human_ceiling"]["remaining_capacity"], 1)
+        self.assertFalse(capacity_receipt["deprecated_alias_used"])
         self.assertEqual(completed["messages"][0]["status"], "completed")
         result = self.run_cli("result", worker_id)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "pass")
+
+    def test_spawn_capacity_refusal_is_structured(self) -> None:
+        result = self.run_cli(
+            "spawn",
+            "--cwd", str(self.repo),
+            "--activation", "explicit-claude",
+            "--native-active", "1",
+            "--native-free-slots", "3",
+            "--codex-model", "gpt-5.6-sol",
+            "--codex-effort", "xhigh",
+            "--codex-approval-policy", "never",
+            "--codex-sandbox", "danger-full-access",
+            "--network", "enabled",
+            "--max-total-worker-lanes", "1",
+            "--name", "refused",
+            input_text="must not launch",
+        )
+        self.assertEqual(result.returncode, 2)
+        receipt = json.loads(result.stderr)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["error_code"], "capacity_refused")
+        self.assertEqual(receipt["capacity"]["current_count"], 1)
+        self.assertEqual(receipt["capacity"]["human_ceiling"]["supplied_max_total_worker_lanes"], 1)
+        self.assertEqual(receipt["capacity"]["human_ceiling"]["remaining_capacity"], 0)
 
     def test_overflow_defaults_primary_codex_to_orchestrator_only(self) -> None:
         spawned = self.spawn(
@@ -575,7 +731,8 @@ for line in sys.stdin:
             "--capacity-retry-interval", "0.05",
         )
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.wait_state(worker_id, {"completed"})
+        completed = self.wait_state(worker_id, {"completed"})
+        self.assertEqual(completed["capacity_at_resume"]["excluded_claude_worker_id"], worker_id)
         invocations = [json.loads(line) for line in self.invocations.read_text().splitlines()]
         self.assertGreaterEqual(len(invocations), 2)
         self.assertEqual({item["session"] for item in invocations}, {session_id})

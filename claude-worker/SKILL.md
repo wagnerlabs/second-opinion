@@ -42,10 +42,10 @@ Depart from this default only when the human explicitly asks the primary agent t
 Resolve the helper relative to this `SKILL.md` and run:
 
 ```sh
-python3 <skill-directory>/scripts/claude_worker.py doctor --cwd <task-repository>
+python3 <skill-directory>/scripts/claude_worker.py doctor --cwd <task-repository> --reconcile
 ```
 
-`doctor` verifies the installed streaming features, current first-party subscription login, prohibited provider overrides, machine state, state migration, skill-owned process recovery, and discovery of `/gpt-second-opinion`. A missing reviewer skill does not block ordinary workers, but it blocks any task that requires that review.
+`doctor --reconcile` verifies the installed streaming features, current first-party subscription login, prohibited provider overrides, machine state, state migration, skill-owned process recovery, and discovery of `/gpt-second-opinion`. Reconcile again before a later capacity calculation if a managed supervisor exited unexpectedly after preflight. A missing reviewer skill does not block ordinary workers, but it blocks any task that requires that review.
 
 Resolve `claude` from the current user's `PATH`. For a nonstandard installation, set `CLAUDE_WORKER_CLAUDE` to that user's Claude Code executable; never embed a user- or machine-specific fallback path.
 
@@ -69,9 +69,9 @@ python3 <skill-directory>/scripts/claude_worker.py capacity \
 
 Use `safe_additional_this_wave` as the machinery's recommendation for how many Claude workers may be added now, never as a requirement to fill every available place. It incorporates CPU, memory, load, disk, workload weight, active native lanes, active or warm skill-owned Claude lanes, an absolute machine guard, and a maximum launch wave of two. Recalculate after every wave and choose the smaller of the recommendation and the number of genuinely independent useful lanes.
 
-`--max-total-worker-lanes N` is an optional human/operator hard ceiling, not the recommendation algorithm. It counts `--native-active` plus active or warm skill-owned Claude worker lanes; it excludes the primary Codex orchestrator, cold-paused Claude lanes, and unrelated external processes. The ceiling can lower the machine-derived allowance but can never raise it. `--max-workers` remains only as a deprecated compatibility alias.
+`--max-total-worker-lanes N` is an optional human/operator hard ceiling, not the recommendation algorithm. Pass the fresh caller-observed native lane count through `--native-active`; the helper adds active or warm skill-owned Claude worker lanes and excludes the primary Codex orchestrator, cold-paused Claude lanes, and unrelated external processes. The ceiling can lower the machine-derived allowance but can never raise it. It is per invocation, so pass it on every `capacity`, `spawn`, `followup`, or `resume` command where the human wants it enforced. `--max-workers` remains only as a deprecated compatibility alias; receipts identify use of that alias and direct the caller to the current name.
 
-Read `human_ceiling` in the capacity receipt for `supplied_max_total_worker_lanes`, `current_count`, `remaining_capacity`, `safe_without_human_ceiling`, `binding`, and `reduced_capacity`. `binding` means the ceiling is at or below the otherwise-safe recommendation; `reduced_capacity` means it strictly lowered that recommendation. The `human_ceiling` gate appears only when the supplied ceiling is binding. The top-level `current_count` is the combined native-plus-Claude lane count used in this arithmetic.
+Read `human_ceiling` in the capacity receipt for `supplied_max_total_worker_lanes`, `current_count`, `remaining_capacity`, `safe_without_human_ceiling`, `binding`, and `reduced_capacity`. `binding` means remaining capacity under the ceiling is at or below the otherwise-safe recommendation; `reduced_capacity` means it is strictly lower. The `human_ceiling` gate appears when the ceiling is binding, including equality. The top-level `current_count` is the combined native-plus-Claude lane count used in this arithmetic. On a refused `spawn`, read the structured stderr JSON's `capacity` object instead of parsing the human-readable `error` string.
 
 Capacity is a ceiling, not a target. Consider build-cache contention, mutable-path overlap, and subscription headroom in addition to the calculated machine signals. On a 16-core/128 GB Mac Studio, a huge number of workers will contend rather than accelerate.
 
@@ -218,6 +218,7 @@ python3 <skill-directory>/scripts/claude_worker.py deny <worker-id> <permission-
 - `pause` interrupts safely. Warm pause keeps the CLI stream for five minutes; expiry becomes cold pause.
 - `resume` needs no queued input. It uses queued messages or a recorded continuation prompt.
 - Cold resume always uses `--resume=<original-session-id>`. It never creates a replacement lane.
+- Resume capacity excludes the worker being reactivated, so a waiting worker does not consume its own prospective lane.
 - `stop` is permanent cancellation, not pause.
 - `approve`/`deny` are valid only for parent-mediated profiles.
 

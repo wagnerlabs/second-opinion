@@ -120,7 +120,7 @@ WORKLOADS = {
 }
 OPUS_BASELINE = (5, 0)
 OPUS_MODEL_PATTERN = re.compile(rb"claude-opus-(\d+)(?:[-.](\d+))?")
-PERMANENTLY_CANCELLED = {"cw-20260809-114551-codex-jira-24h-resumed-af35c48a"}
+DEPRECATED_MAX_WORKERS_NOTICE = "--max-workers is deprecated; use --max-total-worker-lanes"
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -177,6 +177,12 @@ RESULT_SCHEMA = {
 
 class WorkerError(RuntimeError):
     pass
+
+
+class CapacityRefused(WorkerError):
+    def __init__(self, capacity: Dict[str, Any]) -> None:
+        super().__init__("Machine-aware capacity guard refused another worker")
+        self.capacity = capacity
 
 
 def utc_now() -> str:
@@ -577,18 +583,11 @@ def _migrate_manifest(value: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         value.setdefault("session_registered", bool(value.get("turns_completed", 0)))
         value.setdefault("migration", {})
         changed = True
-    worker_id = str(value.get("worker_id") or "")
     disposition = str(value.get("result_disposition") or "pending")
     terminal_receipt = bool(value.get("result_path") and Path(str(value["result_path"])).is_file())
     explicitly_final = disposition in {"rejected", "cancelled", "integrated", "retained"}
     superseded = bool(value.get("superseded_by") or value.get("supersedes"))
-    if worker_id in PERMANENTLY_CANCELLED:
-        if value.get("state") != "cancelled" or disposition != "cancelled":
-            value["state"] = "cancelled"
-            value["result_disposition"] = "cancelled"
-            value["failure_reason"] = "permanently cancelled rejected replacement lane"
-            changed = True
-    elif value.get("state") == "stopped" and not (terminal_receipt or explicitly_final or superseded):
+    if value.get("state") == "stopped" and not (terminal_receipt or explicitly_final or superseded):
         value["state"] = "cold_paused"
         value.setdefault("blocker", {"kind": "legacy_pause", "detail": "migrated from legacy stopped"})
         changed = True
@@ -650,10 +649,12 @@ def process_identity(pid: int) -> Dict[str, Any]:
     }
 
 
-def active_claude_weight() -> Tuple[float, int]:
+def active_claude_weight(exclude_worker_id: Optional[str] = None) -> Tuple[float, int]:
     cpu = 0.0
     count = 0
     for manifest in all_manifests():
+        if exclude_worker_id and manifest.get("worker_id") == exclude_worker_id:
+            continue
         state = str(manifest.get("state"))
         if state not in ACTIVE_STATES and state != "warm_paused":
             continue
@@ -670,9 +671,10 @@ def calculate_capacity(
     native_active: int,
     workload: str,
     max_total_worker_lanes: Optional[int] = None,
+    excluded_claude_worker_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     profile = WORKLOADS[workload]
-    active_cpu, active_claude = active_claude_weight()
+    active_cpu, active_claude = active_claude_weight(excluded_claude_worker_id)
     performance = max(1, int(snapshot["performance_cores"]))
     logical = max(1, int(snapshot["logical_cores"]))
     cpu_budget = performance * 0.8
@@ -718,6 +720,7 @@ def calculate_capacity(
         "active_claude": active_claude,
         "active_claude_weight": active_cpu,
         "current_count": current_count,
+        "excluded_claude_worker_id": excluded_claude_worker_id,
         "workload": workload,
         "profile": profile,
         "limits": {
@@ -742,6 +745,12 @@ def calculate_capacity(
         "machine": snapshot,
         "recorded_at": utc_now(),
     }
+
+
+def annotate_capacity_receipt(result: Dict[str, Any], deprecated_alias_used: bool) -> Dict[str, Any]:
+    result["deprecated_alias_used"] = deprecated_alias_used
+    result["notices"] = [DEPRECATED_MAX_WORKERS_NOTICE] if deprecated_alias_used else []
+    return result
 
 
 def contains_subscription_limit(text: str) -> bool:
@@ -1133,11 +1142,14 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 def command_capacity(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).expanduser().resolve()
-    result = calculate_capacity(
-        machine_snapshot(cwd),
-        native_active=args.native_active,
-        workload=args.workload,
-        max_total_worker_lanes=args.max_total_worker_lanes,
+    result = annotate_capacity_receipt(
+        calculate_capacity(
+            machine_snapshot(cwd),
+            native_active=args.native_active,
+            workload=args.workload,
+            max_total_worker_lanes=args.max_total_worker_lanes,
+        ),
+        args.deprecated_max_workers_used,
     )
     emit(result)
     return 0 if result["safe_additional_this_wave"] > 0 else 3
@@ -1173,14 +1185,17 @@ def command_spawn(args: argparse.Namespace) -> int:
     worker_id = new_worker_id(args.name)
     decision = billing_decision(worker_id, model, effort, args.allow_usage_credits, args.usage_credit_authorization)
     with state_lock():
-        capacity = calculate_capacity(
-            machine_snapshot(cwd),
-            native_active=args.native_active,
-            workload=args.workload,
-            max_total_worker_lanes=args.max_total_worker_lanes,
+        capacity = annotate_capacity_receipt(
+            calculate_capacity(
+                machine_snapshot(cwd),
+                native_active=args.native_active,
+                workload=args.workload,
+                max_total_worker_lanes=args.max_total_worker_lanes,
+            ),
+            args.deprecated_max_workers_used,
         )
         if capacity["safe_additional_this_wave"] < 1:
-            raise WorkerError("Machine-aware capacity guard refused another worker: {}".format(capacity))
+            raise CapacityRefused(capacity)
         worker_dir = workers_root() / worker_id
         ensure_private_dir(worker_dir)
         paths = {
@@ -1248,7 +1263,10 @@ def command_spawn(args: argparse.Namespace) -> int:
             "capacity_at_spawn": capacity,
             "result_disposition": "pending",
             "blocker": None,
-            "notices": [discovery["notice"]] if discovery.get("notice") else [],
+            "notices": (
+                ([discovery["notice"]] if discovery.get("notice") else [])
+                + ([DEPRECATED_MAX_WORKERS_NOTICE] if args.deprecated_max_workers_used else [])
+            ),
         }
         manifest.update({key: str(value) for key, value in paths.items()})
         save_manifest(manifest)
@@ -1369,16 +1387,21 @@ def capacity_for_resume(
     manifest: Dict[str, Any],
     native_active: int,
     max_total_worker_lanes: Optional[int],
+    deprecated_alias_used: bool,
     retry_seconds: float,
     retry_interval: float,
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + retry_seconds
     while True:
-        capacity = calculate_capacity(
-            machine_snapshot(Path(str(manifest["cwd"]))),
-            native_active=native_active,
-            workload=str(manifest.get("workload", "standard")),
-            max_total_worker_lanes=max_total_worker_lanes,
+        capacity = annotate_capacity_receipt(
+            calculate_capacity(
+                machine_snapshot(Path(str(manifest["cwd"]))),
+                native_active=native_active,
+                workload=str(manifest.get("workload", "standard")),
+                max_total_worker_lanes=max_total_worker_lanes,
+                excluded_claude_worker_id=str(manifest["worker_id"]),
+            ),
+            deprecated_alias_used,
         )
         if capacity["safe_additional_this_wave"] >= 1:
             return capacity
@@ -1406,6 +1429,7 @@ def activate_manifest(manifest: Dict[str, Any], args: argparse.Namespace, *, con
         manifest,
         args.native_active,
         args.max_total_worker_lanes,
+        args.deprecated_max_workers_used,
         args.capacity_retry_seconds,
         args.capacity_retry_interval,
     )
@@ -1632,7 +1656,20 @@ def nonnegative_int(raw: str) -> int:
     return value
 
 
+class DeprecatedMaxWorkersAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "deprecated_max_workers_used", True)
+
+
 def add_total_worker_lane_ceiling_arg(parser: argparse.ArgumentParser) -> None:
+    parser.set_defaults(deprecated_max_workers_used=False)
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--max-total-worker-lanes",
@@ -1648,13 +1685,14 @@ def add_total_worker_lane_ceiling_arg(parser: argparse.ArgumentParser) -> None:
         "--max-workers",
         dest="max_total_worker_lanes",
         type=nonnegative_int,
+        action=DeprecatedMaxWorkersAction,
         metavar="N",
         help="deprecated alias for --max-total-worker-lanes",
     )
 
 
 def add_activation_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--native-active", type=int, required=True)
+    parser.add_argument("--native-active", type=nonnegative_int, required=True)
     add_total_worker_lane_ceiling_arg(parser)
     parser.add_argument("--capacity-retry-seconds", type=float, default=300)
     parser.add_argument("--capacity-retry-interval", type=float, default=30)
@@ -1670,15 +1708,15 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=command_doctor)
     capacity = subparsers.add_parser("capacity")
     capacity.add_argument("--cwd", required=True)
-    capacity.add_argument("--native-active", type=int, required=True)
+    capacity.add_argument("--native-active", type=nonnegative_int, required=True)
     capacity.add_argument("--workload", choices=sorted(WORKLOADS), default="standard")
     add_total_worker_lane_ceiling_arg(capacity)
     capacity.set_defaults(func=command_capacity)
     spawn = subparsers.add_parser("spawn")
     spawn.add_argument("--cwd", required=True)
     spawn.add_argument("--activation", choices=("maximal", "explicit-claude"), required=True)
-    spawn.add_argument("--native-active", type=int, required=True)
-    spawn.add_argument("--native-free-slots", type=int, required=True)
+    spawn.add_argument("--native-active", type=nonnegative_int, required=True)
+    spawn.add_argument("--native-free-slots", type=nonnegative_int, required=True)
     spawn.add_argument("--codex-model")
     spawn.add_argument("--codex-effort", choices=sorted(EFFORTS))
     spawn.add_argument("--model")
@@ -1750,6 +1788,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
+    except CapacityRefused as exc:
+        emit(
+            {
+                "ok": False,
+                "error": str(exc),
+                "error_code": "capacity_refused",
+                "capacity": exc.capacity,
+            },
+            stream=sys.stderr,
+        )
+        return 2
     except (WorkerError, OSError, ValueError, subprocess.SubprocessError) as exc:
         emit({"ok": False, "error": str(exc)}, stream=sys.stderr)
         return 2
