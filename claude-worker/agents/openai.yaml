@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Worker"
+  short_description: "Orchestrate Claude workers after native slots fill"
+  default_prompt: "Use $claude-worker only because I explicitly requested Claude workers or maximal machine-aware parallelism. Fill useful native Codex slots first unless I requested Claude, mirror the parent authority, and own every Claude worker through inspected terminal results."
