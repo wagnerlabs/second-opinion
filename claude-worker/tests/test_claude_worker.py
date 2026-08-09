@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import signal
@@ -258,6 +260,74 @@ class ModelAndPolicyTests(unittest.TestCase):
         with mock.patch.object(worker, "active_claude_weight", return_value=(0.25, 1)):
             value = worker.calculate_capacity(snapshot, native_active=3, workload="standard")
         self.assertEqual(value["safe_additional_this_wave"], 2)
+        self.assertEqual(value["current_count"], 4)
+        self.assertIsNone(value["human_ceiling"]["supplied_max_total_worker_lanes"])
+        self.assertIsNone(value["human_ceiling"]["remaining_capacity"])
+        self.assertFalse(value["human_ceiling"]["binding"])
+        self.assertNotIn("human_ceiling", value["gates"])
+
+    def test_total_worker_lane_ceiling_reports_arithmetic_and_binding(self) -> None:
+        snapshot = {
+            "performance_cores": 12,
+            "logical_cores": 16,
+            "total_memory_bytes": 128 * 1024**3,
+            "available_memory_bytes": 100 * 1024**3,
+            "load1": 2.0,
+            "load5": 2.0,
+            "load15": 2.0,
+            "disk_free_bytes": 200 * 1024**3,
+        }
+        with mock.patch.object(worker, "active_claude_weight", return_value=(1.0, 1)):
+            constrained = worker.calculate_capacity(
+                snapshot,
+                native_active=3,
+                workload="standard",
+                max_total_worker_lanes=4,
+            )
+            unconstrained = worker.calculate_capacity(
+                snapshot,
+                native_active=3,
+                workload="standard",
+                max_total_worker_lanes=10,
+            )
+        receipt = constrained["human_ceiling"]
+        self.assertEqual(receipt["supplied_max_total_worker_lanes"], 4)
+        self.assertEqual(receipt["current_count"], 4)
+        self.assertEqual(receipt["native_active"], 3)
+        self.assertEqual(receipt["active_claude"], 1)
+        self.assertEqual(receipt["remaining_capacity"], 0)
+        self.assertFalse(receipt["primary_codex_included"])
+        self.assertTrue(receipt["binding"])
+        self.assertTrue(receipt["reduced_capacity"])
+        self.assertEqual(constrained["safe_additional_this_wave"], 0)
+        self.assertIn("human_ceiling", constrained["gates"])
+        self.assertEqual(unconstrained["safe_additional_this_wave"], 2)
+        self.assertFalse(unconstrained["human_ceiling"]["binding"])
+        self.assertFalse(unconstrained["human_ceiling"]["reduced_capacity"])
+        self.assertNotIn("human_ceiling", unconstrained["gates"])
+
+    def test_total_worker_lane_ceiling_flag_and_deprecated_alias(self) -> None:
+        parser = worker.build_parser()
+        base = ["capacity", "--cwd", "/tmp", "--native-active", "3"]
+        current = parser.parse_args(base + ["--max-total-worker-lanes", "6"])
+        legacy = parser.parse_args(base + ["--max-workers", "6"])
+        self.assertEqual(current.max_total_worker_lanes, 6)
+        self.assertEqual(legacy.max_total_worker_lanes, 6)
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(base + ["--max-total-worker-lanes", "6", "--max-workers", "6"])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            worker.nonnegative_int("-1")
+        help_result = subprocess.run(
+            [sys.executable, str(WORKER_CLI), "capacity", "--help"],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        normalized_help = " ".join(help_result.stdout.split())
+        self.assertIn("combined active native Codex", normalized_help)
+        self.assertIn("excludes the primary Codex orchestrator", normalized_help)
+        self.assertIn("deprecated alias for --max-total-worker-lanes", normalized_help)
 
 
 class HookTests(unittest.TestCase):
@@ -413,7 +483,7 @@ for line in sys.stdin:
             "--codex-approval-policy", "never",
             "--codex-sandbox", "danger-full-access",
             "--network", "enabled",
-            "--max-workers", "1",
+            "--max-total-worker-lanes", "1",
             "--name", "test",
             *extra,
             input_text=task,
@@ -478,7 +548,7 @@ for line in sys.stdin:
             resumed = self.run_cli(
                 "resume", worker_id,
                 "--native-active", "0",
-                "--max-workers", "1",
+                "--max-total-worker-lanes", "1",
                 "--capacity-retry-seconds", "1",
                 "--capacity-retry-interval", "0.05",
             )
@@ -500,7 +570,7 @@ for line in sys.stdin:
         resumed = self.run_cli(
             "resume", worker_id,
             "--native-active", "0",
-            "--max-workers", "1",
+            "--max-total-worker-lanes", "1",
             "--capacity-retry-seconds", "1",
             "--capacity-retry-interval", "0.05",
         )
@@ -524,7 +594,7 @@ for line in sys.stdin:
             "followup", worker_id,
             "--message", "activate now",
             "--native-active", "0",
-            "--max-workers", "1",
+            "--max-total-worker-lanes", "1",
             "--capacity-retry-seconds", "1",
             "--capacity-retry-interval", "0.05",
         )
@@ -548,7 +618,7 @@ for line in sys.stdin:
         resumed = self.run_cli(
             "resume", worker_id,
             "--native-active", "0",
-            "--max-workers", "1",
+            "--max-total-worker-lanes", "1",
             "--capacity-retry-seconds", "0",
             "--capacity-retry-interval", "0.01",
         )

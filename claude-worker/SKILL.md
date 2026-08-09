@@ -67,9 +67,15 @@ python3 <skill-directory>/scripts/claude_worker.py capacity \
   --workload standard
 ```
 
-Capacity is a ceiling, not a target. Consider CPU, memory, load, disk, build-cache contention, mutable-path overlap, and subscription headroom. On a 16-core/128 GB Mac Studio, a huge number of workers will contend rather than accelerate; choose the smallest set of genuinely independent lanes.
+Use `safe_additional_this_wave` as the machinery's recommendation for how many Claude workers may be added now, never as a requirement to fill every available place. It incorporates CPU, memory, load, disk, workload weight, active native lanes, active or warm skill-owned Claude lanes, an absolute machine guard, and a maximum launch wave of two. Recalculate after every wave and choose the smaller of the recommendation and the number of genuinely independent useful lanes.
 
-Warm-paused Claude processes count as 0.25 worker. Cold-paused processes count as zero.
+`--max-total-worker-lanes N` is an optional human/operator hard ceiling, not the recommendation algorithm. It counts `--native-active` plus active or warm skill-owned Claude worker lanes; it excludes the primary Codex orchestrator, cold-paused Claude lanes, and unrelated external processes. The ceiling can lower the machine-derived allowance but can never raise it. `--max-workers` remains only as a deprecated compatibility alias.
+
+Read `human_ceiling` in the capacity receipt for `supplied_max_total_worker_lanes`, `current_count`, `remaining_capacity`, `safe_without_human_ceiling`, `binding`, and `reduced_capacity`. `binding` means the ceiling is at or below the otherwise-safe recommendation; `reduced_capacity` means it strictly lowered that recommendation. The `human_ceiling` gate appears only when the supplied ceiling is binding. The top-level `current_count` is the combined native-plus-Claude lane count used in this arithmetic.
+
+Capacity is a ceiling, not a target. Consider build-cache contention, mutable-path overlap, and subscription headroom in addition to the calculated machine signals. On a 16-core/128 GB Mac Studio, a huge number of workers will contend rather than accelerate.
+
+Warm-paused Claude processes consume 0.25 workload weight for CPU budgeting but still occupy one lane under the absolute and optional total-lane ceilings. Cold-paused processes count as zero.
 
 ## Select model and effort
 

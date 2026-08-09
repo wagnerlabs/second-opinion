@@ -669,7 +669,7 @@ def calculate_capacity(
     *,
     native_active: int,
     workload: str,
-    max_workers: Optional[int] = None,
+    max_total_worker_lanes: Optional[int] = None,
 ) -> Dict[str, Any]:
     profile = WORKLOADS[workload]
     active_cpu, active_claude = active_claude_weight()
@@ -699,18 +699,45 @@ def calculate_capacity(
     elif disk_gib < 25:
         safe = min(safe, 1)
         gates.append("low_disk")
-    if max_workers is not None:
-        safe = min(safe, max(0, max_workers - current_count))
-        gates.append("human_ceiling")
-    safe = min(safe, 2)
+    safe_before_human_ceiling = min(safe, 2)
+    remaining_under_human_ceiling: Optional[int] = None
+    human_ceiling_binding = False
+    human_ceiling_reduced_capacity = False
+    if max_total_worker_lanes is not None:
+        remaining_under_human_ceiling = max(0, max_total_worker_lanes - current_count)
+        human_ceiling_binding = remaining_under_human_ceiling <= safe_before_human_ceiling
+        human_ceiling_reduced_capacity = remaining_under_human_ceiling < safe_before_human_ceiling
+        safe = min(safe_before_human_ceiling, remaining_under_human_ceiling)
+        if human_ceiling_binding:
+            gates.append("human_ceiling")
+    else:
+        safe = safe_before_human_ceiling
     return {
         "safe_additional_this_wave": max(0, safe),
         "native_active": native_active,
         "active_claude": active_claude,
         "active_claude_weight": active_cpu,
+        "current_count": current_count,
         "workload": workload,
         "profile": profile,
-        "limits": {"cpu": by_cpu, "memory": by_memory, "absolute": by_absolute, "wave": 2},
+        "limits": {
+            "cpu": by_cpu,
+            "memory": by_memory,
+            "absolute": by_absolute,
+            "wave": 2,
+            "human_ceiling": remaining_under_human_ceiling,
+        },
+        "human_ceiling": {
+            "supplied_max_total_worker_lanes": max_total_worker_lanes,
+            "current_count": current_count,
+            "native_active": native_active,
+            "active_claude": active_claude,
+            "remaining_capacity": remaining_under_human_ceiling,
+            "safe_without_human_ceiling": safe_before_human_ceiling,
+            "primary_codex_included": False,
+            "binding": human_ceiling_binding,
+            "reduced_capacity": human_ceiling_reduced_capacity,
+        },
         "gates": gates,
         "machine": snapshot,
         "recorded_at": utc_now(),
@@ -1106,7 +1133,12 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 def command_capacity(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).expanduser().resolve()
-    result = calculate_capacity(machine_snapshot(cwd), native_active=args.native_active, workload=args.workload, max_workers=args.max_workers)
+    result = calculate_capacity(
+        machine_snapshot(cwd),
+        native_active=args.native_active,
+        workload=args.workload,
+        max_total_worker_lanes=args.max_total_worker_lanes,
+    )
     emit(result)
     return 0 if result["safe_additional_this_wave"] > 0 else 3
 
@@ -1141,7 +1173,12 @@ def command_spawn(args: argparse.Namespace) -> int:
     worker_id = new_worker_id(args.name)
     decision = billing_decision(worker_id, model, effort, args.allow_usage_credits, args.usage_credit_authorization)
     with state_lock():
-        capacity = calculate_capacity(machine_snapshot(cwd), native_active=args.native_active, workload=args.workload, max_workers=args.max_workers)
+        capacity = calculate_capacity(
+            machine_snapshot(cwd),
+            native_active=args.native_active,
+            workload=args.workload,
+            max_total_worker_lanes=args.max_total_worker_lanes,
+        )
         if capacity["safe_additional_this_wave"] < 1:
             raise WorkerError("Machine-aware capacity guard refused another worker: {}".format(capacity))
         worker_dir = workers_root() / worker_id
@@ -1328,10 +1365,21 @@ def command_send(args: argparse.Namespace) -> int:
     return 0
 
 
-def capacity_for_resume(manifest: Dict[str, Any], native_active: int, max_workers: Optional[int], retry_seconds: float, retry_interval: float) -> Dict[str, Any]:
+def capacity_for_resume(
+    manifest: Dict[str, Any],
+    native_active: int,
+    max_total_worker_lanes: Optional[int],
+    retry_seconds: float,
+    retry_interval: float,
+) -> Dict[str, Any]:
     deadline = time.monotonic() + retry_seconds
     while True:
-        capacity = calculate_capacity(machine_snapshot(Path(str(manifest["cwd"]))), native_active=native_active, workload=str(manifest.get("workload", "standard")), max_workers=max_workers)
+        capacity = calculate_capacity(
+            machine_snapshot(Path(str(manifest["cwd"]))),
+            native_active=native_active,
+            workload=str(manifest.get("workload", "standard")),
+            max_total_worker_lanes=max_total_worker_lanes,
+        )
         if capacity["safe_additional_this_wave"] >= 1:
             return capacity
         if time.monotonic() >= deadline:
@@ -1354,7 +1402,13 @@ def activate_manifest(manifest: Dict[str, Any], args: argparse.Namespace, *, con
     if process_alive(manifest.get("runner_pid")):
         return ipc_request(manifest, "resume" if continuation else "activate", {})
     require_ready_billing(Path(str(manifest["cwd"])))
-    capacity = capacity_for_resume(manifest, args.native_active, args.max_workers, args.capacity_retry_seconds, args.capacity_retry_interval)
+    capacity = capacity_for_resume(
+        manifest,
+        args.native_active,
+        args.max_total_worker_lanes,
+        args.capacity_retry_seconds,
+        args.capacity_retry_interval,
+    )
     manifest["capacity_at_resume"] = capacity
     manifest["state"] = "resuming"
     save_manifest(manifest)
@@ -1568,9 +1622,40 @@ def command_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return value
+
+
+def add_total_worker_lane_ceiling_arg(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--max-total-worker-lanes",
+        dest="max_total_worker_lanes",
+        type=nonnegative_int,
+        metavar="N",
+        help=(
+            "optional ceiling on combined active native Codex and managed Claude worker lanes; "
+            "excludes the primary Codex orchestrator"
+        ),
+    )
+    group.add_argument(
+        "--max-workers",
+        dest="max_total_worker_lanes",
+        type=nonnegative_int,
+        metavar="N",
+        help="deprecated alias for --max-total-worker-lanes",
+    )
+
+
 def add_activation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--native-active", type=int, required=True)
-    parser.add_argument("--max-workers", type=int)
+    add_total_worker_lane_ceiling_arg(parser)
     parser.add_argument("--capacity-retry-seconds", type=float, default=300)
     parser.add_argument("--capacity-retry-interval", type=float, default=30)
     parser.add_argument("--initialization-timeout", type=float, default=20)
@@ -1587,7 +1672,7 @@ def build_parser() -> argparse.ArgumentParser:
     capacity.add_argument("--cwd", required=True)
     capacity.add_argument("--native-active", type=int, required=True)
     capacity.add_argument("--workload", choices=sorted(WORKLOADS), default="standard")
-    capacity.add_argument("--max-workers", type=int)
+    add_total_worker_lane_ceiling_arg(capacity)
     capacity.set_defaults(func=command_capacity)
     spawn = subparsers.add_parser("spawn")
     spawn.add_argument("--cwd", required=True)
@@ -1602,7 +1687,7 @@ def build_parser() -> argparse.ArgumentParser:
     spawn.add_argument("--codex-sandbox", choices=("danger-full-access", "workspace-write", "read-only"), required=True)
     spawn.add_argument("--network", choices=("enabled", "disabled"), required=True)
     spawn.add_argument("--workload", choices=sorted(WORKLOADS), default="standard")
-    spawn.add_argument("--max-workers", type=int)
+    add_total_worker_lane_ceiling_arg(spawn)
     spawn.add_argument("--scope", choices=("read-only", "mutable-disjoint", "mutable-overlap"), default="read-only")
     spawn.add_argument("--isolation", choices=("auto", "shared", "worktree"), default="auto")
     spawn.add_argument("--owned-path", action="append", default=[])
