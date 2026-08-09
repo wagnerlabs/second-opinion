@@ -98,10 +98,9 @@ DENIED_TOOLS = [
     "TeamDelete",
     "Teammate",
     "SendMessage",
-    "Skill",
 ]
-READ_TOOLS = ["Read", "Glob", "Grep", "Bash"]
-MUTATING_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash"]
+READ_TOOLS = ["Read", "Glob", "Grep", "Bash", "Skill"]
+MUTATING_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash", "Skill"]
 WEB_TOOLS = ["WebFetch", "WebSearch"]
 LIMIT_PATTERNS = [
     re.compile(r"continue with (?:usage|api) credits", re.I),
@@ -146,6 +145,23 @@ RESULT_SCHEMA = {
         "head": {"type": ["string", "null"]},
         "proposed_subtasks": {"type": "array", "items": {"type": "string"}},
         "lingering_processes": {"type": "array", "items": {"type": "string"}},
+        "reviews": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "requested_skill": {"type": "string"},
+                    "reviewer_skill": {"type": "string", "enum": ["gpt-second-opinion"]},
+                    "scenario": {"type": "string"},
+                    "model": {"type": "string", "enum": ["gpt-5.6-sol"]},
+                    "effort": {"type": "string", "enum": ["max"]},
+                    "status": {"type": "string", "enum": ["complete", "incomplete"]},
+                    "output_path": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["reviewer_skill", "scenario", "status", "output_path"],
+            },
+        },
     },
     "required": [
         "status",
@@ -259,6 +275,23 @@ def claude_path() -> str:
             "or set CLAUDE_WORKER_CLAUDE to its executable path"
         )
     return str(Path(path).resolve())
+
+
+def claude_skill_path(cwd: Path, name: str) -> Optional[Path]:
+    candidates = [Path.home() / ".claude" / "skills" / name / "SKILL.md"]
+    resolved_cwd = cwd.expanduser().resolve()
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=resolved_cwd, timeout=10)
+    boundary = Path(result.stdout.strip()).resolve() if result.returncode == 0 and result.stdout.strip() else Path(resolved_cwd.anchor)
+    current = resolved_cwd
+    while True:
+        candidates.append(current / ".claude" / "skills" / name / "SKILL.md")
+        if current == boundary or current.parent == current:
+            break
+        current = current.parent
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
 
 
 def child_env(event_log: Optional[Path] = None) -> Dict[str, str]:
@@ -755,11 +788,14 @@ def worker_contract(
 Work only on {ownership}. Scope class: {scope}.
 {authority_receipt}
 Treat the task scope as a behavioral and ownership contract. It does not reduce the inherited runtime authority; obey it even when the parent profile technically permits broader actions.
-Do not invoke Claude, Codex, Agent/Task/Team/Skill tools, slash commands, or any other agent harness. Do not create sub-workers.
+Use all installed Claude Code skills normally when relevant. /claude-second-opinion is the only skill-name exception because it is redirected below. Skills are capabilities, not sub-workers, and remain subject to this authority profile and every nesting control below.
+Do not invoke Claude, Agent/Task/Team tools, agent messaging, or another agent harness. Do not create sub-workers. Do not invoke raw Codex for implementation or general delegation.
+If any instruction says to use /claude-second-opinion, substitute /gpt-second-opinion unconditionally. Invoke the installed /gpt-second-opinion skill normally and block on it; its constrained GPT reviewer subprocess is the sole nested-harness exception. Never invoke /claude-second-opinion. If /gpt-second-opinion is unavailable, report a blocker rather than reimplementing it.
+For a required review, inspect the full reviewer output and access/coverage disclosures, then act on the feedback before completing. Repair and rerun an operationally incomplete review, or report a blocker when it cannot be completed. Do not invent missing transcript or artifact context. Include a structured reviews receipt when a review was requested or performed.
 Do not change authentication, billing, providers, Claude settings, or usage-credit preferences.
 Do not accept any offer to continue with API credits, usage credits, or extra usage. Stop and report SUBSCRIPTION_LIMIT instead unless the task packet records a human-authorized per-worker exception.
 Follow the declared filesystem, network, tool, and external-action authority exactly. Report unavailable capabilities as blockers; never bypass controls.
-Return only the requested structured result. Include changed files, tests and exit codes, blockers, branch/worktree/HEAD, proposed subtasks, and lingering processes. Do not leave background processes running.
+Return only the requested structured result. Include changed files, tests and exit codes, blockers, branch/worktree/HEAD, proposed subtasks, lingering processes, and review receipts when applicable. Do not leave background processes running.
 """.format(
         worker_id=worker_id,
         ownership=ownership,
@@ -905,11 +941,10 @@ def build_stream_command(manifest: Dict[str, Any], *, resume: bool) -> List[str]
         "--effort", str(manifest["effort"]),
         "--permission-mode", str(authority["permission_mode"]),
         "--settings", str(manifest["settings_path"]),
-        "--setting-sources", "",
+        "--setting-sources", "user,project,local",
         "--strict-mcp-config",
         "--mcp-config", str(manifest["mcp_path"]),
         "--no-chrome",
-        "--disable-slash-commands",
         "--tools", ",".join(authority["tools"]),
         "--disallowedTools", ",".join(DENIED_TOOLS),
         "--json-schema", json.dumps(RESULT_SCHEMA, separators=(",", ":"), sort_keys=True),
@@ -1039,13 +1074,31 @@ def command_doctor(args: argparse.Namespace) -> int:
             problems.extend(auth_problems)
         except (WorkerError, OSError, subprocess.SubprocessError) as exc:
             problems.append({"kind": "auth", "detail": str(exc)})
-    checks.update({"policy_hook": POLICY_HOOK.is_file(), "event_hook": EVENT_HOOK.is_file(), "runner": RUNNER.is_file(), "machine": machine_snapshot(cwd)})
+    reviewer_skill = claude_skill_path(cwd, "gpt-second-opinion")
+    checks.update({
+        "policy_hook": POLICY_HOOK.is_file(),
+        "event_hook": EVENT_HOOK.is_file(),
+        "runner": RUNNER.is_file(),
+        "gpt_second_opinion_skill": str(reviewer_skill) if reviewer_skill else None,
+        "gpt_reviewer_codex": shutil.which("codex"),
+        "machine": machine_snapshot(cwd),
+    })
     if args.reconcile:
         checks["reconciled"] = [reconcile_manifest(value)["worker_id"] for value in all_manifests()]
     notices: List[str] = []
     discovery = checks.get("opus_model_discovery")
     if isinstance(discovery, dict) and discovery.get("notice"):
         notices.append(str(discovery["notice"]))
+    if not reviewer_skill:
+        notices.append(
+            "The installed Claude Code /gpt-second-opinion skill was not discovered; ordinary workers remain available, "
+            "but a task requiring that review must stop until the skill is installed."
+        )
+    if not checks.get("gpt_reviewer_codex"):
+        notices.append(
+            "GPT second-opinion substitution is unavailable because `codex` is not on PATH; "
+            "install or expose the current user's Codex executable on PATH before assigning a review."
+        )
     result = {"ok": not problems, "ready_to_spawn": not problems, "checks": checks, "problems": problems, "notices": notices}
     emit(result)
     return 0 if not problems else 2
@@ -1118,6 +1171,11 @@ def command_spawn(args: argparse.Namespace) -> int:
             "workspace": {"mode": isolation, "cwd": str(cwd), "worktree": None},
             "activation": args.activation,
             "native_occupancy_receipt": {"active": args.native_active, "free_slots": args.native_free_slots, "at": utc_now()},
+            "orchestration_policy": {
+                "overflow_mode": args.native_free_slots == 0,
+                "primary_codex_role_default": "orchestrator_only" if args.native_free_slots == 0 else "orchestrator_or_worker",
+                "material_primary_lane_requires_human_override": args.native_free_slots == 0,
+            },
             "model": model,
             "effort": effort,
             "codex_model": args.codex_model,
@@ -1141,6 +1199,15 @@ def command_spawn(args: argparse.Namespace) -> int:
             "owner_nonce": uuid.uuid4().hex,
             "control_socket": str(control_socket),
             "billing": {"auth": safe_auth_summary(auth), "cache": cache, "decision": decision, "best_effort_zero_credit": True},
+            "review_policy": {
+                "substitution": {"claude-second-opinion": "gpt-second-opinion"},
+                "execution_owner": "claude_worker",
+                "skill_invocation": "/gpt-second-opinion",
+                "skill_sources": ["user", "project", "local"],
+                "installed_skills": "allowed_except_claude_second_opinion_substitution",
+                "exception_scope": "blocking_second_opinion_only",
+                "raw_agent_harnesses": "denied_except_constrained_gpt_review",
+            },
             "capacity_at_spawn": capacity,
             "result_disposition": "pending",
             "blocker": None,

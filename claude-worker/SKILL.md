@@ -1,6 +1,6 @@
 ---
 name: claude-worker
-description: "Launch and own Claude Code workers with Codex-like lifecycle control, stable resumable sessions, explicit authority parity, subscription-aware billing gates, machine-aware capacity, and structured terminal results. Use only when the human explicitly requests Claude workers/this skill or explicitly requests maximal or machine-optimal parallelism. Native Codex slots take priority unless the human specifically requests Claude."
+description: "Launch and own Claude Code workers with Codex-like lifecycle control, stable resumable sessions, explicit authority parity, subscription-aware billing gates, machine-aware capacity, GPT reviewer substitution, and structured terminal results. Use only when the human explicitly requests Claude workers/this skill or explicitly requests maximal or machine-optimal parallelism. Native Codex slots take priority unless the human specifically requests Claude."
 ---
 
 # Claude worker
@@ -18,14 +18,23 @@ For maximal-parallelism requests, fill every useful native Codex slot first. Use
 
 Never use this skill for ordinary delegation merely because another lane would be convenient.
 
+## Keep the primary Codex agent orchestration-only in overflow mode
+
+Overflow mode begins when useful native Codex worker slots are full and one or more Claude workers are added. In overflow mode, the primary Codex agent is orchestration-only by default. Delegate all sustained implementation, investigation, and review lanes to native Codex or Claude workers; do not make the primary agent another parallel implementation lane while it is coordinating the saturated worker set.
+
+The primary agent still owns decomposition, task packets, dependency ordering, capacity decisions, steering, permission decisions, progress reporting, terminal-event consumption, result inspection, convergence, and final synthesis. It may run short control or verification commands needed for those duties, but should delegate material edits, lengthy analysis, and test execution whenever they form an independent lane.
+
+Depart from this default only when the human explicitly asks the primary agent to work a lane too, or when a small non-delegable convergence action is necessary. Record that exception and return to orchestration-only work promptly.
+
 ## Non-negotiable controls
 
 - Use managed, noninteractive `claude -p` streaming execution. Native Codex workers are also managed asynchronously rather than through an interactive terminal UI.
 - Use the currently logged-in Claude Code CLI's first-party `claude.ai` subscription auth. Never inject credentials, log in/out, change providers, invoke gateways, or use Bedrock, Vertex, Foundry, or API keys.
 - Never use `bypassPermissions` or `--dangerously-skip-permissions`.
 - Mirror the parent Codex lane's effective approval policy, filesystem sandbox, network access, and declared tools. Do not trust Claude less or more than the native worker.
-- Never let Claude launch Claude, Codex, Agent/Task/Team/Skill tools, slash commands, or another agent harness. Nesting would evade the global native-first and capacity scheduler.
-- Start with empty setting sources, strict empty MCP configuration, Chrome disabled, and slash commands disabled. Add no connector or MCP implicitly.
+- Keep all installed Claude Code skills and slash commands available. `/claude-second-opinion` is the only skill-name exception because it is redirected to `/gpt-second-opinion`. Skills are capabilities, not workers; enforce the no-nesting rule at `Agent`/Task/Team/agent-messaging tools and agent-harness execution instead of denying `Skill` globally.
+- Never let Claude launch Claude, raw Codex implementation/delegation, Agent/Task/Team workers, or another agent harness. The constrained GPT reviewer command emitted by `/gpt-second-opinion` is the sole nested-harness exception.
+- Load normal user, project, and local skill/settings sources. Keep strict empty MCP configuration and Chrome disabled; add no connector or MCP implicitly.
 - Keep every worker attached to the active Codex turn until its terminal event is consumed, result is inspected, and the next action is recorded. The human is never the completion poller.
 
 ## Preflight
@@ -36,7 +45,7 @@ Resolve the helper relative to this `SKILL.md` and run:
 python3 <skill-directory>/scripts/claude_worker.py doctor --cwd <task-repository>
 ```
 
-`doctor` verifies the installed streaming features, current first-party subscription login, prohibited provider overrides, machine state, state migration, and skill-owned process recovery.
+`doctor` verifies the installed streaming features, current first-party subscription login, prohibited provider overrides, machine state, state migration, skill-owned process recovery, and discovery of `/gpt-second-opinion`. A missing reviewer skill does not block ordinary workers, but it blocks any task that requires that review.
 
 Resolve `claude` from the current user's `PATH`. For a nonstandard installation, set `CLAUDE_WORKER_CLAUDE` to that user's Claude Code executable; never embed a user- or machine-specific fallback path.
 
@@ -48,7 +57,8 @@ If `notices` reports an Opus version newer than Opus 5, tell the human promptly.
 2. Inspect the current native Codex agent tree immediately before launch.
 3. Fill useful native slots first unless Claude was explicitly requested.
 4. Run `capacity` with the fresh active-native count and workload.
-5. Add Claude workers in waves of no more than two; recheck after every wave.
+5. Before adding Claude beyond a full native pool, move any material primary-agent lane to a worker and make the primary agent orchestration-only.
+6. Add Claude workers in waves of no more than two; recheck after every wave.
 
 ```sh
 python3 <skill-directory>/scripts/claude_worker.py capacity \
@@ -115,9 +125,9 @@ Mappings:
 
 | Parent profile | Claude behavior |
 |---|---|
-| Unrestricted + `never` | `dontAsk`; bare Read/Glob/Grep/Edit/Write/NotebookEdit/Bash and network tools when enabled; Claude filesystem sandbox disabled. |
+| Unrestricted + `never` | `dontAsk`; bare Read/Glob/Grep/Edit/Write/NotebookEdit/Bash/Skill and network tools when enabled; Claude filesystem sandbox disabled. |
 | Workspace-write + `never` | `dontAsk`; same declared tools; Claude sandbox limits writes to workspace/additional directories; network mirrored. |
-| Read-only + `never` | `dontAsk`; no mutation tools; Read/Glob/Grep/Bash; OS sandbox denies repository writes and unsandboxed commands; network mirrored. |
+| Read-only + `never` | `dontAsk`; no mutation tools; Read/Glob/Grep/Bash/Skill; OS sandbox denies repository writes and unsandboxed commands; network mirrored. |
 | Parent-mediated approvals | `manual`; already-authorized capabilities are represented by the profile and remaining `can_use_tool` requests surface through `approve`/`deny`. |
 
 Task-authorized connectors must be preflighted explicitly. If Claude cannot use a connector the Codex parent has, pass a parent-produced data packet or report the integration unavailable before launch.
@@ -139,7 +149,19 @@ If overlapping mutation needs a worktree and the directory is not a Git reposito
 
 The task must state objective, owned paths, dependencies, forbidden actions, required tests, and completion criteria. Do not assign overlapping mutable ownership.
 
+If a second opinion is required, also include the complete verbatim user transcript available to the parent, the review scenario, the concrete target, every critical/load-bearing material path, and the artifact under review. Do not make the Claude worker reconstruct context that only the parent possesses.
+
 `read-only` describes what the worker may do, while `--codex-sandbox` describes what the parent runtime can technically do. Keep those concepts separate.
+
+## Substitute GPT second opinions
+
+For every Claude worker, replace every instruction to use `claude-second-opinion` with `gpt-second-opinion`. Apply this substitution unconditionally; do not compare worker/reviewer models and do not retain a Claude reviewer because it uses a different Claude model. A direct instruction to use `gpt-second-opinion` follows the same path.
+
+Invoke the installed `/gpt-second-opinion` skill normally. Do not reimplement or wrap it. The policy hook permits the skill's constrained GPT-5.6-Sol reviewer command and continues to reject general `codex exec`, Claude, Gemini, Aider, Goose, Hermes, agent-team, and subagent launches.
+
+Keep every other installed skill available subject to the parent authority profile; `/gpt-second-opinion` is not an allowlist for skills. A skill does not bypass nesting controls: if it attempts to create a sub-worker or invoke another agent harness, block that action while leaving non-nested skill behavior available.
+
+Run `/gpt-second-opinion` synchronously and do not continue the reviewed work while it runs. Follow its own completion gate, repair operational failures when safe, act on substantive feedback using the Claude worker's judgment, and include the review outcome and output path in the worker result. Classify a lane with a non-trivial required review as `heavy` capacity unless the bounded review is demonstrably lighter. If the skill is unavailable, return a blocker rather than improvising a replacement.
 
 ## Spawn
 
@@ -165,7 +187,7 @@ python3 <skill-directory>/scripts/claude_worker.py spawn \
 
 Use `--activation explicit-claude` when the human directly requested Claude. Record real native counts even then.
 
-Spawn does not return ready until the supervisor has created its private socket, validated Claude's session ID, and completed a five-second no-work `get_context_usage` protocol probe. It returns the worker ID, stable session ID, authority receipt, billing decision, capacity receipt, and protocol receipt.
+Spawn does not return ready until the supervisor has created its private socket, validated Claude's session ID, and completed a five-second no-work `get_context_usage` protocol probe. It returns the worker ID, stable session ID, authority receipt, billing decision, capacity receipt, protocol receipt, and orchestration policy. When that receipt reports `overflow_mode: true`, treat `primary_codex_role_default: orchestrator_only` as an operating commitment, not merely metadata.
 
 ## Control and monitoring
 

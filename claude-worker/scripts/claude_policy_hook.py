@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Block subagents, agent teams, auth mutation, and nested harness commands."""
+"""Allow Claude skills while blocking sub-workers and agent harnesses."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from typing import Any, Dict
 DENIED_TOOL_NAMES = {
     "agent",
     "task",
-    "skill",
     "teamcreate",
     "teamdelete",
     "teammate",
@@ -22,7 +21,7 @@ DENIED_TOOL_NAMES = {
 }
 HARNESS_COMMAND = re.compile(
     r"(?:^|[;&|()\s])(?:[^\s;&|()]*/)?"
-    r"(?:claude|codex|gemini|aider|goose|hermes)(?:\s|$)",
+    r"(?P<harness>claude|codex|gemini|aider|goose|hermes)(?:\s|$)",
     re.I,
 )
 AUTH_MUTATION = re.compile(
@@ -31,6 +30,10 @@ AUTH_MUTATION = re.compile(
     re.I,
 )
 TEAM_ENABLE = re.compile(r"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\s*=\s*(?:1|true|yes|on)", re.I)
+CODEX_EXEC = re.compile(
+    r"(?:^|[;&|()\s])(?:[^\s;&|()]*/)?codex\s+exec(?:\s|$)",
+    re.I,
+)
 
 
 def append_event(payload: Dict[str, Any]) -> None:
@@ -44,6 +47,62 @@ def append_event(payload: Dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def skill_name(tool_input: Any) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("skill", "name", "command"):
+        raw = tool_input.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        return raw.strip().split()[0].lstrip("/$").lower()
+    return ""
+
+
+def is_gpt_second_opinion_command(command: str) -> bool:
+    """Recognize the constrained Codex invocation emitted by the installed skill."""
+    harnesses = [match.group("harness").lower() for match in HARNESS_COMMAND.finditer(command)]
+    if harnesses != ["codex"] or len(CODEX_EXEC.findall(command)) != 1:
+        return False
+    if any(
+        count != 1
+        for count in (
+            len(re.findall(r"model_reasoning_effort\s*=", command)),
+            len(re.findall(r"approval_policy\s*=", command)),
+            len(re.findall(r"--sandbox(?:\s|$)", command)),
+            len(re.findall(r"--ephemeral(?:\s|\\|$)", command)),
+        )
+    ):
+        return False
+    required_patterns = (
+        r"(?:^|\s)-m\s+gpt-5\.6-sol(?:\s|\\|$)",
+        r"(?:^|\s)-c\s+model_reasoning_effort=max(?:\s|\\|$)",
+        r"(?:^|\s)-c\s+approval_policy=never(?:\s|\\|$)",
+        r"(?:^|\s)(?:-o|--output-last-message)\s+\S+",
+        r"(?:^|\s)<\s+\S+",
+    )
+    if any(not re.search(pattern, command) for pattern in required_patterns):
+        return False
+    if (
+        "REVIEW STATUS: COMPLETE" not in command
+        or "REVIEW STATUS: INCOMPLETE" not in command
+        or "danger-full-access" in command
+        or "dangerously-bypass-approvals-and-sandbox" in command
+    ):
+        return False
+    literal_sandbox = re.search(
+        r"--sandbox\s+(?:read-only|workspace-write)(?:\s|\\|$)",
+        command,
+    )
+    variable_sandbox = re.search(
+        r"SANDBOX_MODE\s*=\s*['\"]?(?:read-only|workspace-write)['\"]?",
+        command,
+    ) and re.search(
+        r"--sandbox\s+['\"]?\$\{?SANDBOX_MODE\}?['\"]?(?:\s|\\|$)",
+        command,
+    )
+    return bool(literal_sandbox or variable_sandbox)
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -55,12 +114,34 @@ def main() -> int:
     reason = ""
     if tool_name.lower() in DENIED_TOOL_NAMES:
         reason = "Claude workers may not spawn or message sub-workers"
-    elif tool_name.lower() == "bash" and HARNESS_COMMAND.search(command):
-        reason = "Claude workers may not invoke an agent harness through Bash"
+    elif tool_name.lower() == "skill":
+        selected = skill_name(tool_input)
+        if selected == "claude-second-opinion":
+            reason = "Claude workers must substitute /gpt-second-opinion for /claude-second-opinion"
+        else:
+            append_event(
+                {
+                    "event": "skill_invoked",
+                    "skill": selected or "unknown",
+                    "session_id": payload.get("session_id"),
+                }
+            )
+            return 0
     elif tool_name.lower() == "bash" and AUTH_MUTATION.search(command):
         reason = "Claude workers may not mutate Claude authentication"
     elif tool_name.lower() == "bash" and TEAM_ENABLE.search(command):
         reason = "Claude Agent Teams are disabled for managed workers"
+    elif tool_name.lower() == "bash" and HARNESS_COMMAND.search(command):
+        if is_gpt_second_opinion_command(command):
+            append_event(
+                {
+                    "event": "gpt_second_opinion_started",
+                    "tool_name": tool_name,
+                    "session_id": payload.get("session_id"),
+                }
+            )
+            return 0
+        reason = "Claude workers may not invoke an agent harness through Bash"
     if not reason:
         return 0
     append_event(

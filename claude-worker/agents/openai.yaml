@@ -1,4 +1,4 @@
 interface:
   display_name: "Claude Worker"
-  short_description: "Orchestrate Claude workers after native slots fill"
-  default_prompt: "Use $claude-worker only because I explicitly requested Claude workers or maximal machine-aware parallelism. Fill useful native Codex slots first unless I requested Claude, mirror the parent authority, and own every Claude worker through inspected terminal results."
+  short_description: "Orchestrate Claude workers with skill and GPT-review parity"
+  default_prompt: "Use $claude-worker because I explicitly requested Claude workers or maximal machine-aware parallelism; prioritize native Codex slots unless overridden, make the primary Codex agent orchestration-only when Claude extends a saturated native worker pool, mirror parent authority, preserve all installed Claude skills while blocking nested workers, substitute /gpt-second-opinion for /claude-second-opinion, and own each lane through an inspected result."

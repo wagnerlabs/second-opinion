@@ -25,6 +25,24 @@ WORKER_CLI = SCRIPTS / "claude_worker.py"
 POLICY_HOOK = SCRIPTS / "claude_policy_hook.py"
 
 
+def constrained_gpt_review_command(*, sandbox: str = "read-only", model: str = "gpt-5.6-sol") -> str:
+    return "\n".join(
+        [
+            'SANDBOX_MODE="{}"'.format(sandbox),
+            "COMPLETION_REQUIREMENT='REVIEW STATUS: COMPLETE or REVIEW STATUS: INCOMPLETE'",
+            "codex exec \\",
+            "  -m {} \\".format(model),
+            "  -c model_reasoning_effort=max \\",
+            "  -c approval_policy=never \\",
+            '  --sandbox "$SANDBOX_MODE" \\',
+            "  --ephemeral \\",
+            '  -o "$OUT_PATH" \\',
+            '  "$COMPLETION_REQUIREMENT" \\',
+            '  < "$PACKET_PATH"',
+        ]
+    )
+
+
 class ModelAndPolicyTests(unittest.TestCase):
     def test_exact_sol_opus_mapping(self) -> None:
         self.assertEqual(worker.resolve_effort("gpt-5.6-sol", "high", "claude-opus-5", None), "medium")
@@ -55,6 +73,7 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertEqual(unrestricted["permission_mode"], "dontAsk")
         self.assertFalse(unrestricted["claude_sandbox"]["enabled"])
         self.assertIn("Bash", unrestricted["preapproved_tools"])
+        self.assertIn("Skill", unrestricted["preapproved_tools"])
         self.assertIn("WebFetch", unrestricted["tools"])
         workspace = worker.authority_profile("never", "workspace-write", "disabled")
         self.assertTrue(workspace["claude_sandbox"]["enabled"])
@@ -77,6 +96,7 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertEqual(scoped["task_write_boundary"]["mode"], "behavioral_contract")
         unrestricted_settings = worker.hook_settings(Path("/tmp/events"), scoped, Path("/tmp/repo"), [])
         self.assertFalse(unrestricted_settings["sandbox"]["enabled"])
+        self.assertNotIn("Skill", unrestricted_settings["permissions"]["deny"])
         readonly_scoped = worker.apply_task_scope(readonly, "read-only", Path("/tmp/repo"))
         readonly_settings = worker.hook_settings(Path("/tmp/events"), readonly_scoped, Path("/tmp/repo"), [])
         self.assertTrue(readonly_settings["sandbox"]["enabled"])
@@ -116,14 +136,37 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertIn("--replay-user-messages", command)
         self.assertIn("--strict-mcp-config", command)
         self.assertIn("--setting-sources", command)
+        self.assertEqual(command[command.index("--setting-sources") + 1], "user,project,local")
         self.assertIn("--no-chrome", command)
-        self.assertIn("--disable-slash-commands", command)
+        self.assertNotIn("--disable-slash-commands", command)
+        self.assertIn("Skill", command[command.index("--tools") + 1].split(","))
+        self.assertNotIn("Skill", command[command.index("--disallowedTools") + 1].split(","))
         self.assertIn("--session-id", command)
         self.assertNotIn("--resume", command)
         self.assertIn("--resume", resumed)
         self.assertNotIn("--session-id", resumed)
         self.assertNotIn("--dangerously-skip-permissions", command)
         self.assertNotIn("bypassPermissions", command)
+
+    def test_worker_contract_unconditionally_substitutes_gpt_reviewer(self) -> None:
+        contract = worker.worker_contract(
+            "cw-test",
+            "read-only",
+            [],
+            worker.authority_profile("never", "read-only", "disabled"),
+        )
+        self.assertIn("Use all installed Claude Code skills normally", contract)
+        self.assertIn("substitute /gpt-second-opinion unconditionally", contract)
+        self.assertIn("Invoke the installed /gpt-second-opinion skill normally", contract)
+        self.assertIn("Never invoke /claude-second-opinion", contract)
+        self.assertIn("Do not invoke raw Codex for implementation or general delegation", contract)
+        self.assertNotIn("gpt_second_opinion.py", contract)
+        self.assertIn("Do not invent missing transcript or artifact context", contract)
+        self.assertIn("reviews receipt", contract)
+        self.assertEqual(
+            worker.RESULT_SCHEMA["properties"]["reviews"]["items"]["properties"]["reviewer_skill"]["enum"],
+            ["gpt-second-opinion"],
+        )
 
     def test_billing_unknown_requires_per_worker_authorization(self) -> None:
         with self.assertRaises(worker.WorkerError) as caught:
@@ -222,10 +265,45 @@ class HookTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(POLICY_HOOK)], input=json.dumps(payload), text=True, capture_output=True)
 
     def test_subworker_tools_and_harnesses_are_blocked(self) -> None:
-        self.assertEqual(self.run_hook({"tool_name": "Agent", "tool_input": {}}).returncode, 2)
-        self.assertEqual(self.run_hook({"tool_name": "Skill", "tool_input": {}}).returncode, 2)
-        for command in ("claude -p hi", "/usr/local/bin/codex exec hi", "gemini run", "aider file.py"):
+        for tool_name in ("Agent", "Task", "TeamCreate", "TeamDelete", "Teammate", "SendMessage"):
+            self.assertEqual(self.run_hook({"tool_name": tool_name, "tool_input": {}}).returncode, 2)
+        for command in (
+            "claude -p hi",
+            "/usr/local/bin/codex exec hi",
+            "gemini run",
+            "aider file.py",
+            "goose run hi",
+            "hermes chat",
+        ):
             self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {"command": command}}).returncode, 2)
+
+    def test_installed_skills_and_gpt_reviewer_skill_are_allowed(self) -> None:
+        for name in ("code-review", "frontend-design", "gpt-second-opinion"):
+            result = self.run_hook({"tool_name": "Skill", "tool_input": {"skill": name}})
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_claude_reviewer_skill_is_redirected(self) -> None:
+        result = self.run_hook({"tool_name": "Skill", "tool_input": {"skill": "claude-second-opinion"}})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("substitute /gpt-second-opinion", result.stderr)
+
+    def test_constrained_gpt_reviewer_command_is_allowed(self) -> None:
+        result = self.run_hook({"tool_name": "Bash", "tool_input": {"command": constrained_gpt_review_command()}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_near_miss_gpt_reviewer_commands_are_blocked(self) -> None:
+        variants = (
+            constrained_gpt_review_command(model="gpt-5.5"),
+            constrained_gpt_review_command(sandbox="danger-full-access"),
+            constrained_gpt_review_command().replace("REVIEW STATUS: INCOMPLETE", "review incomplete"),
+            constrained_gpt_review_command() + "\nclaude -p nested",
+        )
+        for command in variants:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self.run_hook({"tool_name": "Bash", "tool_input": {"command": command}}).returncode,
+                    2,
+                )
 
     def test_normal_command_is_allowed(self) -> None:
         self.assertEqual(self.run_hook({"tool_name": "Bash", "tool_input": {"command": "git status"}}).returncode, 0)
@@ -360,10 +438,35 @@ for line in sys.stdin:
         self.assertEqual(completed["manifest_version"], 2)
         self.assertTrue(completed["session_registered"])
         self.assertEqual(completed["protocol_status"], "ready")
+        self.assertEqual(
+            completed["review_policy"]["substitution"],
+            {"claude-second-opinion": "gpt-second-opinion"},
+        )
+        self.assertEqual(
+            completed["review_policy"]["installed_skills"],
+            "allowed_except_claude_second_opinion_substitution",
+        )
+        self.assertEqual(completed["review_policy"]["skill_invocation"], "/gpt-second-opinion")
+        self.assertEqual(
+            completed["review_policy"]["raw_agent_harnesses"],
+            "denied_except_constrained_gpt_review",
+        )
+        self.assertFalse(completed["orchestration_policy"]["overflow_mode"])
+        self.assertEqual(completed["orchestration_policy"]["primary_codex_role_default"], "orchestrator_or_worker")
         self.assertEqual(completed["messages"][0]["status"], "completed")
         result = self.run_cli("result", worker_id)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "pass")
+
+    def test_overflow_defaults_primary_codex_to_orchestrator_only(self) -> None:
+        spawned = self.spawn(
+            "finish overflow lane",
+            extra=("--activation", "maximal", "--native-free-slots", "0"),
+        )
+        policy = spawned["orchestration_policy"]
+        self.assertTrue(policy["overflow_mode"])
+        self.assertEqual(policy["primary_codex_role_default"], "orchestrator_only")
+        self.assertTrue(policy["material_primary_lane_requires_human_override"])
 
     def test_three_warm_pause_resume_cycles_keep_ids(self) -> None:
         spawned = self.spawn("HOLD the first turn")
