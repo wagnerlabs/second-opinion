@@ -754,6 +754,7 @@ def worker_contract(
     return """You are Claude worker {worker_id}, a top-level lane owned by a Codex orchestrator.
 Work only on {ownership}. Scope class: {scope}.
 {authority_receipt}
+Treat the task scope as a behavioral and ownership contract. It does not reduce the inherited runtime authority; obey it even when the parent profile technically permits broader actions.
 Do not invoke Claude, Codex, Agent/Task/Team/Skill tools, slash commands, or any other agent harness. Do not create sub-workers.
 Do not change authentication, billing, providers, Claude settings, or usage-credit preferences.
 Do not accept any offer to continue with API credits, usage credits, or extra usage. Stop and report SUBSCRIPTION_LIMIT instead unless the task packet records a human-authorized per-worker exception.
@@ -801,17 +802,11 @@ def apply_task_scope(authority: Dict[str, Any], scope: str, cwd: Path) -> Dict[s
     value = json.loads(json.dumps(authority))
     value["task_scope"] = scope
     if scope == "read-only":
-        mutations = {"Edit", "Write", "NotebookEdit"}
-        value["tools"] = [tool for tool in value["tools"] if tool not in mutations]
-        value["preapproved_tools"] = [
-            tool for tool in value["preapproved_tools"] if tool not in mutations
-        ]
-        value["claude_sandbox"] = {
-            "enabled": True,
-            "autoAllowBashIfSandboxed": True,
-            "allowUnsandboxedCommands": False,
+        value["task_write_boundary"] = {
+            "mode": "behavioral_contract",
+            "paths": [str(cwd)],
+            "runtime_authority_source": "parent_codex_profile",
         }
-        value["task_write_boundary"] = {"mode": "deny", "paths": [str(cwd)]}
     return value
 
 
@@ -821,10 +816,9 @@ def hook_settings(event_log: Path, authority: Dict[str, Any], cwd: Path, add_dir
     stop = "{} {} --event stop".format(sys.executable, EVENT_HOOK)
     sandbox = dict(authority["claude_sandbox"])
     if sandbox.get("enabled"):
-        task_read_only = authority.get("task_scope") == "read-only"
         sandbox["filesystem"] = {
-            "allowWrite": [str(cwd)] + list(add_dirs) if authority["codex"]["sandbox_mode"] == "workspace-write" and not task_read_only else [],
-            "denyWrite": [str(cwd)] if authority["codex"]["sandbox_mode"] == "read-only" or task_read_only else [],
+            "allowWrite": [str(cwd)] + list(add_dirs) if authority["codex"]["sandbox_mode"] == "workspace-write" else [],
+            "denyWrite": [str(cwd)] if authority["codex"]["sandbox_mode"] == "read-only" else [],
         }
         sandbox["network"] = {"allowedDomains": ["*"] if authority["network_enabled"] else []}
     return {

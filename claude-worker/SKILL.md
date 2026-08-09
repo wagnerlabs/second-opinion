@@ -122,6 +122,10 @@ Mappings:
 
 Task-authorized connectors must be preflighted explicitly. If Claude cannot use a connector the Codex parent has, pass a parent-produced data packet or report the integration unavailable before launch.
 
+Treat `--scope` as a behavioral and ownership contract, not a second authority profile. Never tighten the inherited sandbox, tool set, keyring access, proxy trust, or network environment merely because a task is labeled `read-only`; native Codex workers do not receive that additional downgrade. The parent Codex profile is the sole source of runtime authority. A read-only task must still obey its no-mutation contract through its task packet and result audit.
+
+Preserve the parent process environment needed by authorized shell tools, including credential-store and TLS configuration. Preflight task-required CLIs inside the worker. If a CLI that succeeds in the parent fails inside Claude because credentials, Keychain access, certificates, proxies, or network trust differ, report an authority-parity blocker rather than treating the tool as unavailable in general.
+
 ## Workspace and task packet
 
 Shared working directory is the default, matching native Codex workers. Native workers do not receive a worktree by default.
@@ -134,6 +138,8 @@ Shared working directory is the default, matching native Codex workers. Native w
 If overlapping mutation needs a worktree and the directory is not a Git repository, launch fails rather than risking overlap.
 
 The task must state objective, owned paths, dependencies, forbidden actions, required tests, and completion criteria. Do not assign overlapping mutable ownership.
+
+`read-only` describes what the worker may do, while `--codex-sandbox` describes what the parent runtime can technically do. Keep those concepts separate.
 
 ## Spawn
 

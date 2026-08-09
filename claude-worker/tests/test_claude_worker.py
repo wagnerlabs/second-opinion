@@ -70,10 +70,30 @@ class ModelAndPolicyTests(unittest.TestCase):
         with self.assertRaises(worker.WorkerError):
             worker.authority_profile(None, "read-only", "disabled")
         scoped = worker.apply_task_scope(unrestricted, "read-only", Path("/tmp/repo"))
-        self.assertNotIn("Edit", scoped["tools"])
-        self.assertNotIn("Write", scoped["preapproved_tools"])
-        self.assertTrue(scoped["claude_sandbox"]["enabled"])
-        self.assertEqual(scoped["task_write_boundary"]["mode"], "deny")
+        self.assertEqual(scoped["tools"], unrestricted["tools"])
+        self.assertEqual(scoped["preapproved_tools"], unrestricted["preapproved_tools"])
+        self.assertEqual(scoped["claude_sandbox"], unrestricted["claude_sandbox"])
+        self.assertFalse(scoped["claude_sandbox"]["enabled"])
+        self.assertEqual(scoped["task_write_boundary"]["mode"], "behavioral_contract")
+        unrestricted_settings = worker.hook_settings(Path("/tmp/events"), scoped, Path("/tmp/repo"), [])
+        self.assertFalse(unrestricted_settings["sandbox"]["enabled"])
+        readonly_scoped = worker.apply_task_scope(readonly, "read-only", Path("/tmp/repo"))
+        readonly_settings = worker.hook_settings(Path("/tmp/events"), readonly_scoped, Path("/tmp/repo"), [])
+        self.assertTrue(readonly_settings["sandbox"]["enabled"])
+        self.assertEqual(readonly_settings["sandbox"]["filesystem"]["denyWrite"], ["/tmp/repo"])
+
+    def test_child_environment_preserves_parent_tool_auth_and_tls_context(self) -> None:
+        inherited = {
+            "PATH": "/usr/bin:/bin",
+            "GH_CONFIG_DIR": "/tmp/gh-config",
+            "HTTPS_PROXY": "http://127.0.0.1:1234",
+            "SSL_CERT_FILE": "/tmp/parent-ca.pem",
+        }
+        with mock.patch.dict(os.environ, inherited, clear=True):
+            child = worker.child_env()
+        for name, value in inherited.items():
+            self.assertEqual(child[name], value)
+        self.assertEqual(child["CLAUDE_WORKER_MANAGED"], "1")
 
     def test_stream_command_is_persistent_isolated_and_resumable(self) -> None:
         manifest = {
