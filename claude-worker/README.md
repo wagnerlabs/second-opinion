@@ -8,10 +8,12 @@ The primary Codex agent remains the orchestrator by default when Claude workers 
 
 ## Capacity
 
-The skill's `capacity` command recommends how many Claude workers may be added in the next wave from current CPU, memory, load, disk, workload, and existing-lane state. Its recommendation is capped at two workers per wave and should be recalculated between waves; there is no fixed recommended Claude-worker cap.
+The skill's `capacity` command recommends how many Claude workers may be added in the next wave from three sampled CPU/disk intervals, memory, free disk, workload, and role-aware orchestration state. Its recommendation is capped at two workers per wave and should be recalculated between waves; there is no fixed recommended Claude-worker cap.
 
-The optional `--max-total-worker-lanes N` flag is a separate human/operator hard ceiling. The caller supplies the current active native Codex lane count with `--native-active`; the skill adds active or warm skill-owned Claude worker lanes and excludes the primary Codex orchestrator. The ceiling can lower the machinery's recommendation but cannot raise it, and it must be passed on every `capacity`, `spawn`, `followup`, or `resume` invocation where the operator wants it enforced. The older `--max-workers` spelling is retained only as a deprecated compatibility alias.
+The caller supplies a fresh schema-versioned JSON document through `--orchestration-state`. It identifies the primary controller, occupied native workers, direct reviewers, workloads, statuses, and the native child limit. The helper validates freshness and consistency, discovers its own managed Claude workers, and reports controller/native/Claude/reviewer accounting separately. This replaces the error-prone `--native-active` and `--native-free-slots` flags.
 
-Capacity output reports the supplied ceiling, combined current count, remaining capacity, and whether the ceiling is binding or actually reduced the recommendation. A refused `spawn` returns the same capacity receipt as structured JSON.
+The optional `--max-total-worker-lanes N` flag is a separate human/operator hard ceiling over native plus managed-Claude top-level worker lanes. It excludes the controller and direct reviewers; reviewer machine pressure is still included in resource accounting. The removed `--max-workers` alias is intentionally rejected.
+
+Capacity output reports role classification, resource weights, sampled telemetry, the supplied ceiling, combined current count, remaining capacity, and whether the ceiling is binding or actually reduced the recommendation. A refused `spawn` returns the same capacity receipt as structured JSON. Standard and heavy local tests/builds remain parent-scheduled one at a time across every role until measured evidence justifies automatic queuing.
 
 See [`SKILL.md`](SKILL.md) for the canonical agent-facing workflow and controls.

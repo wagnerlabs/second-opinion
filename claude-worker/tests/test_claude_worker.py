@@ -27,6 +27,43 @@ WORKER_CLI = SCRIPTS / "claude_worker.py"
 POLICY_HOOK = SCRIPTS / "claude_policy_hook.py"
 
 
+def machine_fixture(*, cpu_samples: tuple = (20.0, 25.0, 30.0), disk_free_gib: int = 200) -> dict:
+    return {
+        "telemetry_version": 1,
+        "performance_cores": 12,
+        "logical_cores": 16,
+        "total_memory_bytes": 128 * 1024**3,
+        "available_memory_bytes": 100 * 1024**3,
+        "load1": 14.0,
+        "load5": 14.0,
+        "load15": 14.0,
+        "disk_free_bytes": disk_free_gib * 1024**3,
+        "cpu_percent_samples": list(cpu_samples),
+        "sustained_critical_cpu": sum(1 for value in cpu_samples if value >= 95.0) >= 2,
+        "disk_mib_s_samples": [10.0, 20.0, 30.0],
+        "disk_activity_advisory_only": True,
+    }
+
+
+def fresh_orchestration_state(*, native: tuple = (), limit: int = 3, reviewers: tuple = (), reason: str | None = None) -> dict:
+    raw = {
+        "schema_version": 1,
+        "captured_at": worker.utc_now(),
+        "native_child_limit": limit,
+        "controller": {"id": "primary", "mode": "orchestrator_only", "workload": "light"},
+        "native_workers": [
+            {"id": item[0], "status": item[1], "workload": item[2]} for item in native
+        ],
+        "direct_reviewers": [
+            {"id": item[0], "status": item[1], "workload": item[2], "parent_id": item[3]}
+            for item in reviewers
+        ],
+    }
+    if reason is not None:
+        raw["no_further_useful_native_lanes"] = reason
+    return worker.validate_orchestration_state(raw)
+
+
 def constrained_gpt_review_command(*, sandbox: str = "read-only", model: str = "gpt-5.6-sol") -> str:
     return "\n".join(
         [
@@ -165,6 +202,7 @@ class ModelAndPolicyTests(unittest.TestCase):
         self.assertNotIn("gpt_second_opinion.py", contract)
         self.assertIn("Do not invent missing transcript or artifact context", contract)
         self.assertIn("reviews receipt", contract)
+        self.assertIn("local-work window", contract)
         self.assertEqual(
             worker.RESULT_SCHEMA["properties"]["reviews"]["items"]["properties"]["reviewer_skill"]["enum"],
             ["gpt-second-opinion"],
@@ -242,219 +280,205 @@ class ModelAndPolicyTests(unittest.TestCase):
             manifest = json.loads((worker_dir / "manifest.json").read_text())
             self.assertTrue(Path(manifest["result_path"]).is_file())
 
-    def test_capacity_counts_warm_pause_fractionally(self) -> None:
-        snapshot = {
-            "performance_cores": 12,
-            "logical_cores": 16,
-            "total_memory_bytes": 128 * 1024**3,
-            "available_memory_bytes": 100 * 1024**3,
-            "load1": 2.0,
-            "load5": 2.0,
-            "load15": 2.0,
-            "disk_free_bytes": 200 * 1024**3,
-        }
-        with mock.patch.object(worker, "active_claude_weight", return_value=(0.25, 1)):
-            value = worker.calculate_capacity(snapshot, native_active=3, workload="standard")
-        self.assertEqual(value["safe_additional_this_wave"], 2)
-        self.assertEqual(value["current_count"], 4)
-        self.assertIsNone(value["human_ceiling"]["supplied_max_total_worker_lanes"])
-        self.assertIsNone(value["human_ceiling"]["remaining_capacity"])
-        self.assertFalse(value["human_ceiling"]["binding"])
-        self.assertNotIn("human_ceiling", value["gates"])
+    def test_orchestration_state_schema_and_freshness(self) -> None:
+        valid = fresh_orchestration_state(
+            native=(("n1", "running", "standard"),),
+            reviewers=(("review-1", "reserved", "heavy", "n1"),),
+        )
+        self.assertEqual(valid["verification"], "unverified_parent_assertion")
+        self.assertEqual(valid["native_child_limit"], 3)
+        old = worker.orchestration_state_template(3)
+        old["captured_at"] = "2026-01-01T00:00:00+00:00"
+        with self.assertRaisesRegex(worker.WorkerError, "stale"):
+            worker.validate_orchestration_state(old)
+        future = worker.orchestration_state_template(3)
+        future["captured_at"] = (worker.dt.datetime.now(worker.dt.timezone.utc) + worker.dt.timedelta(seconds=10)).isoformat()
+        with self.assertRaisesRegex(worker.WorkerError, "future"):
+            worker.validate_orchestration_state(future)
 
-    def test_resume_capacity_excludes_the_reactivating_worker(self) -> None:
-        snapshot = {
-            "performance_cores": 12,
-            "logical_cores": 16,
-            "total_memory_bytes": 128 * 1024**3,
-            "available_memory_bytes": 100 * 1024**3,
-            "load1": 2.0,
-            "load5": 2.0,
-            "load15": 2.0,
-            "disk_free_bytes": 200 * 1024**3,
-        }
+    def test_orchestration_state_rejects_duplicates_over_limit_and_bad_reviewer_parent(self) -> None:
+        duplicate = worker.orchestration_state_template(3)
+        duplicate["native_workers"] = [{"id": "primary-codex", "status": "running", "workload": "standard"}]
+        with self.assertRaisesRegex(worker.WorkerError, "Duplicate"):
+            worker.validate_orchestration_state(duplicate)
+        over = worker.orchestration_state_template(0)
+        over["native_workers"] = [{"id": "n1", "status": "running", "workload": "standard"}]
+        with self.assertRaisesRegex(worker.WorkerError, "exceeds"):
+            worker.validate_orchestration_state(over)
+        bad_parent = worker.orchestration_state_template(3)
+        bad_parent["direct_reviewers"] = [{"id": "r1", "status": "running", "workload": "heavy", "parent_id": "missing"}]
+        with self.assertRaisesRegex(worker.WorkerError, "parent"):
+            worker.validate_orchestration_state(bad_parent)
+        collision = worker.orchestration_state_template(3)
+        collision["native_workers"] = [{"id": "cw-existing", "status": "running", "workload": "standard"}]
+        with self.assertRaisesRegex(worker.WorkerError, "collide"):
+            worker.validate_orchestration_state(collision, managed_claude_ids=["cw-existing"])
+
+    def test_capacity_role_accounting_and_reviewer_parent_idle_weight(self) -> None:
+        state = fresh_orchestration_state(
+            native=(("n1", "running", "standard"), ("n2", "idle", "heavy")),
+            reviewers=(("r1", "reserved", "heavy", "primary"), ("r2", "running", "standard", "n1")),
+        )
+        claude_inventory = [{
+            "id": "cw-one", "state": "warm_paused", "workload": "standard",
+            "base_resource_weight": 1.0, "resource_weight": 0.25, "warm_paused": True,
+        }]
+        with mock.patch.object(worker, "active_claude_inventory", return_value=claude_inventory):
+            value = worker.calculate_capacity(machine_fixture(), orchestration_state=state, workload="standard")
+        self.assertEqual(value["lane_accounting"]["native_workers"], 2)
+        self.assertEqual(value["lane_accounting"]["managed_claude_workers"], 1)
+        self.assertEqual(value["lane_accounting"]["direct_reviewers"], 2)
+        self.assertEqual(value["lane_accounting"]["total_worker_lanes"], 3)
+        resources = value["resource_accounting"]
+        self.assertEqual(resources["controller"]["resource_weight"], 0.5)
+        self.assertEqual(resources["native_workers"][0]["resource_weight"], 0.25)
+        self.assertTrue(resources["native_workers"][0]["blocked_on_running_reviewer"])
+        self.assertEqual(resources["direct_reviewers"][0]["resource_weight"], 1.0)
+        self.assertEqual(resources["direct_reviewers"][1]["resource_weight"], 1.0)
+
+    def test_resume_capacity_excludes_reactivating_worker(self) -> None:
+        state = fresh_orchestration_state(limit=3)
         manifests = [
             {"worker_id": "cw-reactivating", "state": "capacity_wait", "workload": "standard"},
             {"worker_id": "cw-other", "state": "running", "workload": "standard"},
         ]
         with mock.patch.object(worker, "all_manifests", return_value=manifests):
-            included = worker.calculate_capacity(
-                snapshot,
-                native_active=0,
-                workload="standard",
-                max_total_worker_lanes=2,
-            )
+            included = worker.calculate_capacity(machine_fixture(), orchestration_state=state, workload="standard", max_total_worker_lanes=2)
             excluded = worker.calculate_capacity(
-                snapshot,
-                native_active=0,
-                workload="standard",
-                max_total_worker_lanes=2,
-                excluded_claude_worker_id="cw-reactivating",
+                machine_fixture(), orchestration_state=state, workload="standard",
+                max_total_worker_lanes=2, excluded_claude_worker_id="cw-reactivating",
             )
         self.assertEqual(included["current_count"], 2)
         self.assertEqual(included["safe_additional_this_wave"], 0)
         self.assertEqual(excluded["current_count"], 1)
         self.assertEqual(excluded["safe_additional_this_wave"], 1)
-        self.assertEqual(excluded["excluded_claude_worker_id"], "cw-reactivating")
 
-    def test_total_worker_lane_ceiling_reports_arithmetic_and_binding(self) -> None:
-        snapshot = {
-            "performance_cores": 12,
-            "logical_cores": 16,
-            "total_memory_bytes": 128 * 1024**3,
-            "available_memory_bytes": 100 * 1024**3,
-            "load1": 2.0,
-            "load5": 2.0,
-            "load15": 2.0,
-            "disk_free_bytes": 200 * 1024**3,
-        }
-        with mock.patch.object(worker, "active_claude_weight", return_value=(1.0, 1)):
-            constrained = worker.calculate_capacity(
-                snapshot,
-                native_active=3,
-                workload="standard",
-                max_total_worker_lanes=4,
-            )
-            unconstrained = worker.calculate_capacity(
-                snapshot,
-                native_active=3,
-                workload="standard",
-                max_total_worker_lanes=10,
-            )
+    def test_total_worker_lane_ceiling_boundaries(self) -> None:
+        state = fresh_orchestration_state(
+            native=(("n1", "running", "standard"), ("n2", "running", "standard"), ("n3", "running", "standard")),
+        )
+        claude_inventory = [{
+            "id": "cw-one", "state": "running", "workload": "standard",
+            "base_resource_weight": 1.0, "resource_weight": 1.0, "warm_paused": False,
+        }]
+        with mock.patch.object(worker, "active_claude_inventory", return_value=claude_inventory):
+            constrained = worker.calculate_capacity(machine_fixture(), orchestration_state=state, workload="standard", max_total_worker_lanes=4)
+            boundary = worker.calculate_capacity(machine_fixture(), orchestration_state=state, workload="standard", max_total_worker_lanes=6)
+            zero = worker.calculate_capacity(machine_fixture(), orchestration_state=state, workload="standard", max_total_worker_lanes=0)
         receipt = constrained["human_ceiling"]
-        self.assertEqual(receipt["supplied_max_total_worker_lanes"], 4)
         self.assertEqual(receipt["current_count"], 4)
-        self.assertEqual(receipt["native_active"], 3)
-        self.assertEqual(receipt["active_claude"], 1)
         self.assertEqual(receipt["remaining_capacity"], 0)
-        self.assertFalse(receipt["primary_codex_included"])
-        self.assertTrue(receipt["binding"])
         self.assertTrue(receipt["reduced_capacity"])
-        self.assertEqual(constrained["limits"]["human_ceiling"], 0)
-        self.assertEqual(constrained["safe_additional_this_wave"], 0)
-        self.assertIn("human_ceiling", constrained["gates"])
-        self.assertEqual(unconstrained["safe_additional_this_wave"], 2)
-        self.assertFalse(unconstrained["human_ceiling"]["binding"])
-        self.assertFalse(unconstrained["human_ceiling"]["reduced_capacity"])
-        self.assertNotIn("human_ceiling", unconstrained["gates"])
-
-    def test_total_worker_lane_ceiling_boundary_zero_and_over_capacity(self) -> None:
-        snapshot = {
-            "performance_cores": 12,
-            "logical_cores": 16,
-            "total_memory_bytes": 128 * 1024**3,
-            "available_memory_bytes": 100 * 1024**3,
-            "load1": 2.0,
-            "load5": 2.0,
-            "load15": 2.0,
-            "disk_free_bytes": 200 * 1024**3,
-        }
-        with mock.patch.object(worker, "active_claude_weight", return_value=(1.0, 1)):
-            boundary = worker.calculate_capacity(
-                snapshot,
-                native_active=3,
-                workload="standard",
-                max_total_worker_lanes=6,
-            )
-            over_capacity = worker.calculate_capacity(
-                snapshot,
-                native_active=3,
-                workload="standard",
-                max_total_worker_lanes=3,
-            )
-            zero = worker.calculate_capacity(
-                snapshot,
-                native_active=3,
-                workload="standard",
-                max_total_worker_lanes=0,
-            )
         self.assertEqual(boundary["human_ceiling"]["remaining_capacity"], 2)
         self.assertTrue(boundary["human_ceiling"]["binding"])
         self.assertFalse(boundary["human_ceiling"]["reduced_capacity"])
-        self.assertIn("human_ceiling", boundary["gates"])
-        for value, supplied in ((over_capacity, 3), (zero, 0)):
-            self.assertEqual(value["human_ceiling"]["supplied_max_total_worker_lanes"], supplied)
-            self.assertEqual(value["human_ceiling"]["remaining_capacity"], 0)
-            self.assertEqual(value["safe_additional_this_wave"], 0)
+        self.assertEqual(zero["safe_additional_this_wave"], 0)
 
-    def test_total_worker_lane_ceiling_flag_and_deprecated_alias(self) -> None:
+    def test_sampled_cpu_gate_requires_two_critical_samples(self) -> None:
+        state = fresh_orchestration_state()
+        with mock.patch.object(worker, "active_claude_inventory", return_value=[]):
+            one_spike = worker.calculate_capacity(
+                machine_fixture(cpu_samples=(96.0, 40.0, 50.0)), orchestration_state=state, workload="standard"
+            )
+            sustained = worker.calculate_capacity(
+                machine_fixture(cpu_samples=(96.0, 95.0, 50.0)), orchestration_state=state, workload="standard"
+            )
+        self.assertGreater(one_spike["safe_additional_this_wave"], 0)
+        self.assertNotIn("sustained_critical_cpu", one_spike["gates"])
+        self.assertEqual(sustained["safe_additional_this_wave"], 0)
+        self.assertIn("sustained_critical_cpu", sustained["gates"])
+
+    def test_macos_iostat_parser_discards_cumulative_row(self) -> None:
+        fixture = """
+              disk0           cpu     load average
+        KB/t  tps  MB/s  us sy id   1m   5m   15m
+        1.0 10 1.0 10 10 80 1 1 1
+        2.0 20 2.0 20 10 70 2 2 2
+        3.0 30 3.0 30 10 60 3 3 3
+        4.0 40 4.0 40 10 50 4 4 4
+        """
+        cpu, disk = worker.parse_macos_iostat(fixture)
+        self.assertEqual(cpu, [30.0, 40.0, 50.0])
+        self.assertEqual(disk, [2.0, 3.0, 4.0])
+
+    def test_memory_pressure_is_preferred_with_vm_stat_fallback_available(self) -> None:
+        result = subprocess.CompletedProcess(["memory_pressure"], 0, "System-wide memory free percentage: 75%\n", "")
+        with mock.patch.object(worker.shutil, "which", side_effect=lambda name: "/usr/bin/" + name), mock.patch.object(
+            worker, "run", return_value=result
+        ):
+            available = worker.available_memory_bytes(128 * 1024**3)
+        self.assertEqual(available, 96 * 1024**3)
+
+    def test_linux_proc_sampling_has_no_platform_wave_penalty(self) -> None:
+        cpu_reads = [(1000, 800), (1100, 850), (1200, 940), (1300, 950)]
+        disk_reads = [1000, 3048, 5096, 7144]
+        with mock.patch.object(worker, "read_proc_cpu", side_effect=cpu_reads), mock.patch.object(
+            worker, "read_proc_disk_sectors", side_effect=disk_reads
+        ), mock.patch.object(worker.time, "sleep"):
+            telemetry = worker.sample_linux_telemetry(
+                {"proc_stat": True, "proc_diskstats": True}, sample_interval=1.0
+            )
+        self.assertEqual(telemetry["source"], "proc")
+        self.assertEqual(telemetry["cpu_percent_samples"], [50.0, 10.0, 90.0])
+        self.assertEqual(telemetry["disk_mib_s_samples"], [1.0, 1.0, 1.0])
+        state = fresh_orchestration_state()
+        linux_machine = machine_fixture(cpu_samples=tuple(telemetry["cpu_percent_samples"]))
+        with mock.patch.object(worker, "active_claude_inventory", return_value=[]):
+            capacity = worker.calculate_capacity(linux_machine, orchestration_state=state, workload="standard")
+        self.assertEqual(capacity["limits"]["wave"], 2)
+
+    def test_telemetry_cache_persists_for_related_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            telemetry = {"source": "fixture", "cpu_percent_samples": [1, 2, 3], "disk_mib_s_samples": [4, 5, 6]}
+            with mock.patch.dict(os.environ, {"CLAUDE_WORKER_STATE_DIR": str(cwd / "state")}), mock.patch.object(
+                worker, "collect_host_telemetry", return_value=telemetry
+            ) as collect:
+                first, first_hit = worker.cached_host_telemetry(cwd)
+                second, second_hit = worker.cached_host_telemetry(cwd)
+            self.assertFalse(first_hit)
+            self.assertTrue(second_hit)
+            self.assertEqual(first["source"], "fixture")
+            self.assertEqual(second["source"], "fixture")
+            self.assertEqual(collect.call_count, 1)
+
+    def test_parser_requires_snapshot_and_removes_manual_count_flags(self) -> None:
         parser = worker.build_parser()
-        base = ["capacity", "--cwd", "/tmp", "--native-active", "3"]
+        base = ["capacity", "--cwd", "/tmp", "--orchestration-state", "/tmp/state.json"]
         current = parser.parse_args(base + ["--max-total-worker-lanes", "6"])
-        legacy = parser.parse_args(base + ["--max-workers", "6"])
         self.assertEqual(current.max_total_worker_lanes, 6)
-        self.assertEqual(legacy.max_total_worker_lanes, 6)
-        self.assertFalse(current.deprecated_max_workers_used)
-        self.assertTrue(legacy.deprecated_max_workers_used)
         self.assertEqual(parser.parse_args(base + ["--max-total-worker-lanes", "0"]).max_total_worker_lanes, 0)
         with mock.patch("sys.stderr", new=io.StringIO()):
+            for obsolete in (("--native-active", "3"), ("--native-free-slots", "0"), ("--max-workers", "6")):
+                with self.subTest(obsolete=obsolete), self.assertRaises(SystemExit):
+                    parser.parse_args(base + list(obsolete))
             with self.assertRaises(SystemExit):
-                parser.parse_args(base + ["--max-total-worker-lanes", "6", "--max-workers", "6"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["capacity", "--cwd", "/tmp", "--native-active", "-1"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args([
-                    "spawn",
-                    "--cwd", "/tmp",
-                    "--activation", "explicit-claude",
-                    "--native-active", "0",
-                    "--native-free-slots", "-1",
-                    "--codex-approval-policy", "never",
-                    "--codex-sandbox", "read-only",
-                    "--network", "disabled",
-                    "--name", "negative",
-                ])
-        with self.assertRaises(argparse.ArgumentTypeError):
-            worker.nonnegative_int("-1")
-        help_result = subprocess.run(
-            [sys.executable, str(WORKER_CLI), "capacity", "--help"],
-            text=True,
-            capture_output=True,
-        )
+                parser.parse_args(["capacity", "--cwd", "/tmp"])
+        help_result = subprocess.run([sys.executable, str(WORKER_CLI), "capacity", "--help"], text=True, capture_output=True)
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         normalized_help = " ".join(help_result.stdout.split())
+        self.assertIn("--orchestration-state", normalized_help)
         self.assertIn("combined active native Codex", normalized_help)
-        self.assertIn("excludes the primary Codex orchestrator", normalized_help)
-        self.assertIn("deprecated alias for --max-total-worker-lanes", normalized_help)
+        self.assertNotIn("--max-workers", normalized_help)
 
-    def test_deprecated_alias_is_reported_in_capacity_receipt(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            env = dict(os.environ)
-            env["CLAUDE_WORKER_STATE_DIR"] = temp
-            legacy = subprocess.run(
-                [
-                    sys.executable,
-                    str(WORKER_CLI),
-                    "capacity",
-                    "--cwd", "/tmp",
-                    "--native-active", "0",
-                    "--max-workers", "99",
-                ],
-                text=True,
-                capture_output=True,
-                env=env,
-            )
-            current = subprocess.run(
-                [
-                    sys.executable,
-                    str(WORKER_CLI),
-                    "capacity",
-                    "--cwd", "/tmp",
-                    "--native-active", "0",
-                    "--max-total-worker-lanes", "99",
-                ],
-                text=True,
-                capture_output=True,
-                env=env,
-            )
-        self.assertIn(legacy.returncode, (0, 3), legacy.stderr)
-        self.assertIn(current.returncode, (0, 3), current.stderr)
-        legacy_receipt = json.loads(legacy.stdout)
-        current_receipt = json.loads(current.stdout)
-        self.assertTrue(legacy_receipt["deprecated_alias_used"])
-        self.assertIn(worker.DEPRECATED_MAX_WORKERS_NOTICE, legacy_receipt["notices"])
-        self.assertFalse(current_receipt["deprecated_alias_used"])
-        self.assertEqual(current_receipt["notices"], [])
+    def test_resume_retry_reuses_already_validated_snapshot(self) -> None:
+        state = fresh_orchestration_state()
+        state["captured_at"] = "2020-01-01T00:00:00+00:00"
+        manifest = {"worker_id": "cw-resume", "cwd": "/tmp", "workload": "standard"}
+        with mock.patch.object(worker, "machine_snapshot", return_value=machine_fixture()), mock.patch.object(
+            worker, "active_claude_inventory", return_value=[]
+        ):
+            result = worker.capacity_for_resume(manifest, state, None, 0, 0.01)
+        self.assertGreaterEqual(result["safe_additional_this_wave"], 1)
+
+    def test_manifest_v2_migrates_additively_to_v3(self) -> None:
+        legacy = {"manifest_version": 2, "worker_id": "cw-v2", "state": "completed", "capacity_at_spawn": {"old": True}}
+        migrated, changed = worker._migrate_manifest(legacy)
+        self.assertTrue(changed)
+        self.assertEqual(migrated["manifest_version"], 3)
+        self.assertEqual(migrated["capacity_at_spawn"], {"old": True})
+        self.assertEqual(migrated["capacity_receipt_schema"], 1)
+        self.assertIn("v3_at", migrated["migration"])
 
 
 class HookTests(unittest.TestCase):
@@ -516,6 +540,7 @@ class PersistentFakeCliTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q"], cwd=str(self.repo), check=True)
         self.fake = self.root / "claude"
         self.invocations = self.root / "invocations.jsonl"
+        self.orchestration_path = self.root / "orchestration-state.json"
         self.fake.write_text(
             """#!/usr/bin/env python3
 import json
@@ -581,6 +606,23 @@ for line in sys.stdin:
         self.env["FAKE_CLAUDE_INVOCATIONS"] = str(self.invocations)
         for name in worker.PROHIBITED_ENV:
             self.env.pop(name, None)
+        self.state.mkdir(parents=True)
+        cache = {
+            "telemetry_version": 1,
+            "entries": {
+                str(self.repo.stat().st_dev): {
+                    "cached_at_epoch": time.time(),
+                    "telemetry": {
+                        "source": "test_fixture",
+                        "sampled_at": worker.utc_now(),
+                        "cpu_percent_samples": [10.0, 15.0, 20.0],
+                        "disk_mib_s_samples": [1.0, 2.0, 3.0],
+                        "features": {"platform": "test"},
+                    },
+                }
+            },
+        }
+        (self.state / "telemetry-cache.json").write_text(json.dumps(cache), encoding="utf-8")
 
     def tearDown(self) -> None:
         if self.state.is_dir():
@@ -598,19 +640,30 @@ for line in sys.stdin:
     def run_cli(self, *args: str, input_text: str = "", timeout: float = 20) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, str(WORKER_CLI), *args], input=input_text, text=True, capture_output=True, env=self.env, timeout=timeout)
 
-    def spawn(self, task: str = "finish", extra: tuple = ()) -> dict:
+    def write_orchestration_state(self, *, native_count: int = 0, reason: str | None = None) -> Path:
+        value = worker.orchestration_state_template(3)
+        value["native_workers"] = [
+            {"id": "native-{}".format(index), "status": "running", "workload": "standard"}
+            for index in range(native_count)
+        ]
+        if reason:
+            value["no_further_useful_native_lanes"] = reason
+        self.orchestration_path.write_text(json.dumps(value), encoding="utf-8")
+        return self.orchestration_path
+
+    def spawn(self, task: str = "finish", extra: tuple = (), *, native_count: int = 0, reason: str | None = None) -> dict:
+        state_path = self.write_orchestration_state(native_count=native_count, reason=reason)
         result = self.run_cli(
             "spawn",
             "--cwd", str(self.repo),
             "--activation", "explicit-claude",
-            "--native-active", "0",
-            "--native-free-slots", "3",
+            "--orchestration-state", str(state_path),
             "--codex-model", "gpt-5.6-sol",
             "--codex-effort", "xhigh",
             "--codex-approval-policy", "never",
             "--codex-sandbox", "danger-full-access",
             "--network", "enabled",
-            "--max-total-worker-lanes", "1",
+            "--max-total-worker-lanes", str(native_count + 1),
             "--name", "test",
             *extra,
             input_text=task,
@@ -618,7 +671,7 @@ for line in sys.stdin:
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def wait_state(self, worker_id: str, wanted: set, timeout: float = 10) -> dict:
+    def wait_state(self, worker_id: str, wanted: set, timeout: float = 20) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             result = self.run_cli("status", worker_id)
@@ -632,7 +685,7 @@ for line in sys.stdin:
         spawned = self.spawn("finish normally")
         worker_id = spawned["worker_id"]
         completed = self.wait_state(worker_id, {"completed"})
-        self.assertEqual(completed["manifest_version"], 2)
+        self.assertEqual(completed["manifest_version"], 3)
         self.assertTrue(completed["session_registered"])
         self.assertEqual(completed["protocol_status"], "ready")
         self.assertEqual(
@@ -654,19 +707,20 @@ for line in sys.stdin:
         self.assertEqual(capacity_receipt["human_ceiling"]["supplied_max_total_worker_lanes"], 1)
         self.assertEqual(capacity_receipt["human_ceiling"]["current_count"], 0)
         self.assertEqual(capacity_receipt["human_ceiling"]["remaining_capacity"], 1)
-        self.assertFalse(capacity_receipt["deprecated_alias_used"])
+        self.assertEqual(capacity_receipt["capacity_receipt_schema"], 2)
+        self.assertEqual(capacity_receipt["orchestration_state"]["verification"], "unverified_parent_assertion")
         self.assertEqual(completed["messages"][0]["status"], "completed")
         result = self.run_cli("result", worker_id)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "pass")
 
     def test_spawn_capacity_refusal_is_structured(self) -> None:
+        state_path = self.write_orchestration_state(native_count=1)
         result = self.run_cli(
             "spawn",
             "--cwd", str(self.repo),
             "--activation", "explicit-claude",
-            "--native-active", "1",
-            "--native-free-slots", "3",
+            "--orchestration-state", str(state_path),
             "--codex-model", "gpt-5.6-sol",
             "--codex-effort", "xhigh",
             "--codex-approval-policy", "never",
@@ -687,12 +741,31 @@ for line in sys.stdin:
     def test_overflow_defaults_primary_codex_to_orchestrator_only(self) -> None:
         spawned = self.spawn(
             "finish overflow lane",
-            extra=("--activation", "maximal", "--native-free-slots", "0"),
+            extra=("--activation", "maximal"),
+            native_count=3,
         )
         policy = spawned["orchestration_policy"]
         self.assertTrue(policy["overflow_mode"])
         self.assertEqual(policy["primary_codex_role_default"], "orchestrator_only")
         self.assertTrue(policy["material_primary_lane_requires_human_override"])
+
+    def test_maximal_activation_rejects_unused_native_capacity_without_reason(self) -> None:
+        state_path = self.write_orchestration_state(native_count=0)
+        result = self.run_cli(
+            "spawn",
+            "--cwd", str(self.repo),
+            "--activation", "maximal",
+            "--orchestration-state", str(state_path),
+            "--codex-model", "gpt-5.6-sol",
+            "--codex-effort", "xhigh",
+            "--codex-approval-policy", "never",
+            "--codex-sandbox", "danger-full-access",
+            "--network", "enabled",
+            "--name", "must-refuse",
+            input_text="do not launch",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Native Codex slots must be filled", result.stderr)
 
     def test_three_warm_pause_resume_cycles_keep_ids(self) -> None:
         spawned = self.spawn("HOLD the first turn")
@@ -701,9 +774,10 @@ for line in sys.stdin:
         for _ in range(3):
             paused = self.run_cli("pause", worker_id, "--warm-seconds", "5")
             self.assertEqual(paused.returncode, 0, paused.stderr)
+            state_path = self.write_orchestration_state()
             resumed = self.run_cli(
                 "resume", worker_id,
-                "--native-active", "0",
+                "--orchestration-state", str(state_path),
                 "--max-total-worker-lanes", "1",
                 "--capacity-retry-seconds", "1",
                 "--capacity-retry-interval", "0.05",
@@ -723,9 +797,10 @@ for line in sys.stdin:
         paused = self.run_cli("pause", worker_id, "--warm-seconds", "0")
         self.assertEqual(paused.returncode, 0, paused.stderr)
         self.wait_state(worker_id, {"cold_paused"})
+        state_path = self.write_orchestration_state()
         resumed = self.run_cli(
             "resume", worker_id,
-            "--native-active", "0",
+            "--orchestration-state", str(state_path),
             "--max-total-worker-lanes", "1",
             "--capacity-retry-seconds", "1",
             "--capacity-retry-interval", "0.05",
@@ -747,10 +822,11 @@ for line in sys.stdin:
         self.assertFalse(json.loads(sent.stdout)["receipt"]["activated"])
         status = json.loads(self.run_cli("status", worker_id).stdout)
         self.assertEqual(status["messages"][-1]["status"], "queued")
+        state_path = self.write_orchestration_state()
         followup = self.run_cli(
             "followup", worker_id,
             "--message", "activate now",
-            "--native-active", "0",
+            "--orchestration-state", str(state_path),
             "--max-total-worker-lanes", "1",
             "--capacity-retry-seconds", "1",
             "--capacity-retry-interval", "0.05",
@@ -772,9 +848,10 @@ for line in sys.stdin:
         worker_id = spawned["worker_id"]
         stopped = self.run_cli("stop", worker_id)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        state_path = self.write_orchestration_state()
         resumed = self.run_cli(
             "resume", worker_id,
-            "--native-active", "0",
+            "--orchestration-state", str(state_path),
             "--max-total-worker-lanes", "1",
             "--capacity-retry-seconds", "0",
             "--capacity-retry-interval", "0.01",

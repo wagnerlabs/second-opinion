@@ -17,6 +17,7 @@ import json
 import math
 import mmap
 import os
+import platform
 import re
 import shutil
 import signal
@@ -33,7 +34,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 POLICY_HOOK = SCRIPT_DIR / "claude_policy_hook.py"
 EVENT_HOOK = SCRIPT_DIR / "claude_event_hook.py"
 RUNNER = SCRIPT_DIR / "claude_worker_runner.py"
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
+ORCHESTRATION_STATE_VERSION = 1
+TELEMETRY_VERSION = 1
+ORCHESTRATION_STATE_MAX_AGE_SECONDS = 60
+ORCHESTRATION_STATE_MAX_FUTURE_SECONDS = 5
+TELEMETRY_CACHE_SECONDS = 10
 SOL_OPUS_EFFORT_MAP = {"high": "medium", "xhigh": "high", "max": "xhigh"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 MODEL_ALIASES = {
@@ -120,7 +126,10 @@ WORKLOADS = {
 }
 OPUS_BASELINE = (5, 0)
 OPUS_MODEL_PATTERN = re.compile(rb"claude-opus-(\d+)(?:[-.](\d+))?")
-DEPRECATED_MAX_WORKERS_NOTICE = "--max-workers is deprecated; use --max-total-worker-lanes"
+CONTROLLER_MODES = {"orchestrator_only", "orchestrator_and_worker"}
+NATIVE_WORKER_STATUSES = {"starting", "running", "idle", "blocked", "review_blocked", "paused"}
+REVIEWER_STATUSES = {"reserved", "running"}
+IDENTITY_PATTERN = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -514,7 +523,8 @@ def billing_decision(
 
 def sysctl_int(name: str, fallback: int) -> int:
     try:
-        result = run(["/usr/sbin/sysctl", "-n", name], timeout=5)
+        executable = shutil.which("sysctl") or "/usr/sbin/sysctl"
+        result = run([executable, "-n", name], timeout=5)
         if result.returncode == 0:
             return int(result.stdout.strip())
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -522,11 +532,39 @@ def sysctl_int(name: str, fallback: int) -> int:
     return fallback
 
 
+def telemetry_features() -> Dict[str, Any]:
+    system = platform.system().lower()
+    architecture = platform.machine().lower()
+    return {
+        "platform": system or "unknown",
+        "architecture": architecture or "unknown",
+        "apple_silicon": system == "darwin" and architecture in {"arm64", "aarch64"},
+        "iostat": shutil.which("iostat"),
+        "memory_pressure": shutil.which("memory_pressure"),
+        "vm_stat": shutil.which("vm_stat"),
+        "sysctl": shutil.which("sysctl") or ("/usr/sbin/sysctl" if Path("/usr/sbin/sysctl").is_file() else None),
+        "proc_stat": Path("/proc/stat").is_file(),
+        "proc_diskstats": Path("/proc/diskstats").is_file(),
+    }
+
+
 def available_memory_bytes(total: int) -> int:
+    pressure = shutil.which("memory_pressure")
+    if pressure:
+        try:
+            result = run([pressure, "-Q"], timeout=5)
+            match = re.search(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%", result.stdout)
+            if result.returncode == 0 and match:
+                return int(total * max(0.0, min(100.0, float(match.group(1)))) / 100.0)
+        except (OSError, subprocess.SubprocessError):
+            pass
     executable = shutil.which("vm_stat")
     if not executable:
         return total
-    result = run([executable], timeout=5)
+    try:
+        result = run([executable], timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return total
     if result.returncode != 0:
         return total
     page_size = 4096
@@ -546,6 +584,145 @@ def available_memory_bytes(total: int) -> int:
     return pages * page_size if pages else total
 
 
+def parse_macos_iostat(text: str) -> Tuple[List[float], List[float]]:
+    """Parse macOS iostat rows, discarding the cumulative first report."""
+    rows: List[List[float]] = []
+    for line in text.splitlines():
+        tokens = line.split()
+        if len(tokens) < 6:
+            continue
+        try:
+            values = [float(token) for token in tokens]
+        except ValueError:
+            continue
+        rows.append(values)
+    if len(rows) >= 4:
+        rows = rows[-3:]
+    elif len(rows) > 1:
+        rows = rows[1:]
+    cpu_samples: List[float] = []
+    disk_samples: List[float] = []
+    for values in rows[-3:]:
+        # macOS rows end in: cpu us/sy/id, then load averages 1m/5m/15m.
+        idle = values[-4]
+        cpu_samples.append(round(max(0.0, min(100.0, 100.0 - idle)), 2))
+        disk_values = values[:-6]
+        throughput = sum(disk_values[index] for index in range(2, len(disk_values), 3))
+        disk_samples.append(round(max(0.0, throughput), 3))
+    return cpu_samples, disk_samples
+
+
+def sample_macos_telemetry(features: Dict[str, Any]) -> Dict[str, Any]:
+    executable = features.get("iostat")
+    if not executable:
+        return {"source": "unavailable", "cpu_percent_samples": [], "disk_mib_s_samples": []}
+    try:
+        result = run([str(executable), "-c", "4", "-w", "1"], timeout=8)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "source": "iostat_error",
+            "cpu_percent_samples": [],
+            "disk_mib_s_samples": [],
+            "error": str(exc)[:500],
+        }
+    if result.returncode != 0:
+        return {
+            "source": "iostat_error",
+            "cpu_percent_samples": [],
+            "disk_mib_s_samples": [],
+            "error": (result.stderr or result.stdout).strip()[:500],
+        }
+    cpu, disk = parse_macos_iostat(result.stdout)
+    return {
+        "source": "iostat" if len(cpu) == 3 else "iostat_incomplete",
+        "cpu_percent_samples": cpu,
+        "disk_mib_s_samples": disk,
+    }
+
+
+def read_proc_cpu() -> Tuple[int, int]:
+    line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+    fields = [int(value) for value in line.split()[1:]]
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+    return sum(fields), idle
+
+
+def read_proc_disk_sectors() -> int:
+    total = 0
+    for line in Path("/proc/diskstats").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) < 14:
+            continue
+        name = fields[2]
+        if name.startswith(("loop", "ram", "fd")):
+            continue
+        total += int(fields[5]) + int(fields[9])
+    return total
+
+
+def sample_linux_telemetry(features: Dict[str, Any], sample_interval: float = 1.0) -> Dict[str, Any]:
+    if not features.get("proc_stat"):
+        return {"source": "unavailable", "cpu_percent_samples": [], "disk_mib_s_samples": []}
+    cpu_samples: List[float] = []
+    disk_samples: List[float] = []
+    previous_total, previous_idle = read_proc_cpu()
+    previous_sectors = read_proc_disk_sectors() if features.get("proc_diskstats") else None
+    for _ in range(3):
+        time.sleep(sample_interval)
+        current_total, current_idle = read_proc_cpu()
+        total_delta = max(1, current_total - previous_total)
+        idle_delta = max(0, current_idle - previous_idle)
+        cpu_samples.append(round(max(0.0, min(100.0, 100.0 * (1.0 - idle_delta / total_delta))), 2))
+        if previous_sectors is not None:
+            current_sectors = read_proc_disk_sectors()
+            disk_samples.append(round(max(0.0, (current_sectors - previous_sectors) * 512 / 1024**2 / sample_interval), 3))
+            previous_sectors = current_sectors
+        previous_total, previous_idle = current_total, current_idle
+    return {"source": "proc", "cpu_percent_samples": cpu_samples, "disk_mib_s_samples": disk_samples}
+
+
+def collect_host_telemetry(features: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if features.get("apple_silicon"):
+            return sample_macos_telemetry(features)
+        if features.get("platform") == "linux":
+            return sample_linux_telemetry(features)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"source": "sampling_error", "cpu_percent_samples": [], "disk_mib_s_samples": [], "error": str(exc)[:500]}
+    return {"source": "unavailable", "cpu_percent_samples": [], "disk_mib_s_samples": []}
+
+
+def telemetry_cache_path() -> Path:
+    return state_root() / "telemetry-cache.json"
+
+
+def cached_host_telemetry(cwd: Path) -> Tuple[Dict[str, Any], bool]:
+    key = str(cwd.stat().st_dev)
+    now = time.time()
+    path = telemetry_cache_path()
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError):
+        cache = {}
+    entry = cache.get("entries", {}).get(key) if isinstance(cache, dict) else None
+    if isinstance(entry, dict) and isinstance(entry.get("telemetry"), dict):
+        try:
+            cache_age = now - float(entry.get("cached_at_epoch", 0))
+        except (TypeError, ValueError):
+            cache_age = TELEMETRY_CACHE_SECONDS + 1
+        if 0 <= cache_age <= TELEMETRY_CACHE_SECONDS:
+            value = dict(entry["telemetry"])
+            value["cache_age_seconds"] = round(cache_age, 2)
+            return value, True
+    features = telemetry_features()
+    value = collect_host_telemetry(features)
+    value.update({"features": features, "sampled_at": utc_now(), "cache_age_seconds": 0.0})
+    entries = cache.get("entries", {}) if isinstance(cache, dict) and isinstance(cache.get("entries"), dict) else {}
+    entries[key] = {"cached_at_epoch": now, "telemetry": value}
+    atomic_write_json(path, {"telemetry_version": TELEMETRY_VERSION, "entries": entries})
+    return value, False
+
+
 def machine_snapshot(cwd: Path) -> Dict[str, Any]:
     logical = os.cpu_count() or 1
     performance = sysctl_int("hw.perflevel0.physicalcpu", max(1, logical // 2))
@@ -553,7 +730,11 @@ def machine_snapshot(cwd: Path) -> Dict[str, Any]:
     available_memory = available_memory_bytes(total_memory)
     load1, load5, load15 = os.getloadavg()
     disk = shutil.disk_usage(str(cwd))
+    telemetry, cache_hit = cached_host_telemetry(cwd)
+    cpu_samples = [float(value) for value in telemetry.get("cpu_percent_samples", [])]
+    critical_samples = sum(1 for value in cpu_samples if value >= 95.0)
     return {
+        "telemetry_version": TELEMETRY_VERSION,
         "performance_cores": performance,
         "logical_cores": logical,
         "total_memory_bytes": total_memory,
@@ -562,7 +743,159 @@ def machine_snapshot(cwd: Path) -> Dict[str, Any]:
         "load5": load5,
         "load15": load15,
         "disk_free_bytes": disk.free,
+        "telemetry": telemetry,
+        "telemetry_cache_hit": cache_hit,
+        "cpu_percent_samples": cpu_samples,
+        "sustained_critical_cpu": len(cpu_samples) >= 3 and critical_samples >= 2,
+        "disk_mib_s_samples": [float(value) for value in telemetry.get("disk_mib_s_samples", [])],
+        "disk_activity_advisory_only": True,
     }
+
+
+def orchestration_state_template(native_child_limit: int) -> Dict[str, Any]:
+    return {
+        "schema_version": ORCHESTRATION_STATE_VERSION,
+        "captured_at": utc_now(),
+        "native_child_limit": native_child_limit,
+        "controller": {
+            "id": "primary-codex",
+            "mode": "orchestrator_only",
+            "workload": "light",
+        },
+        "native_workers": [],
+        "direct_reviewers": [],
+    }
+
+
+def _require_exact_keys(value: Dict[str, Any], required: set, optional: set, label: str) -> None:
+    missing = required - set(value)
+    unknown = set(value) - required - optional
+    if missing:
+        raise WorkerError("{} is missing required fields: {}".format(label, ", ".join(sorted(missing))))
+    if unknown:
+        raise WorkerError("{} contains unknown fields: {}".format(label, ", ".join(sorted(unknown))))
+
+
+def _validate_identity(value: Any, label: str) -> str:
+    identity = str(value or "")
+    if not IDENTITY_PATTERN.fullmatch(identity):
+        raise WorkerError("{} must be a stable 1-128 character identity".format(label))
+    return identity
+
+
+def validate_orchestration_state(
+    raw: Any,
+    *,
+    managed_claude_ids: Sequence[str] = (),
+    now: Optional[dt.datetime] = None,
+) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise WorkerError("Orchestration state must be a JSON object")
+    _require_exact_keys(
+        raw,
+        {"schema_version", "captured_at", "native_child_limit", "controller", "native_workers", "direct_reviewers"},
+        {"no_further_useful_native_lanes"},
+        "Orchestration state",
+    )
+    if raw.get("schema_version") != ORCHESTRATION_STATE_VERSION:
+        raise WorkerError("Unsupported orchestration-state schema version")
+    try:
+        captured = parse_time(str(raw["captured_at"]))
+    except (TypeError, ValueError) as exc:
+        raise WorkerError("orchestration-state captured_at must be an ISO-8601 timestamp") from exc
+    if captured.tzinfo is None:
+        raise WorkerError("orchestration-state captured_at must include a timezone")
+    current = now or dt.datetime.now(dt.timezone.utc)
+    age = (current - captured.astimezone(dt.timezone.utc)).total_seconds()
+    if age > ORCHESTRATION_STATE_MAX_AGE_SECONDS:
+        raise WorkerError("orchestration-state snapshot is stale ({:.1f}s old; maximum is {}s)".format(age, ORCHESTRATION_STATE_MAX_AGE_SECONDS))
+    if age < -ORCHESTRATION_STATE_MAX_FUTURE_SECONDS:
+        raise WorkerError("orchestration-state snapshot is more than {}s in the future".format(ORCHESTRATION_STATE_MAX_FUTURE_SECONDS))
+    limit = raw.get("native_child_limit")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise WorkerError("native_child_limit must be a non-negative integer")
+    controller = raw.get("controller")
+    if not isinstance(controller, dict):
+        raise WorkerError("controller must be an object")
+    _require_exact_keys(controller, {"id", "mode", "workload"}, set(), "controller")
+    controller_id = _validate_identity(controller.get("id"), "controller.id")
+    if controller.get("mode") not in CONTROLLER_MODES:
+        raise WorkerError("controller.mode must be one of {}".format(", ".join(sorted(CONTROLLER_MODES))))
+    if controller.get("workload") not in WORKLOADS:
+        raise WorkerError("controller.workload must be light, standard, or heavy")
+    native_workers = raw.get("native_workers")
+    reviewers = raw.get("direct_reviewers")
+    if not isinstance(native_workers, list) or not isinstance(reviewers, list):
+        raise WorkerError("native_workers and direct_reviewers must be arrays")
+    if len(native_workers) > limit:
+        raise WorkerError("native worker occupancy exceeds native_child_limit")
+    identities = {controller_id}
+    normalized_native: List[Dict[str, str]] = []
+    for index, item in enumerate(native_workers):
+        if not isinstance(item, dict):
+            raise WorkerError("native_workers[{}] must be an object".format(index))
+        _require_exact_keys(item, {"id", "status", "workload"}, set(), "native_workers[{}]".format(index))
+        identity = _validate_identity(item.get("id"), "native_workers[{}].id".format(index))
+        if identity in identities:
+            raise WorkerError("Duplicate orchestration identity: {}".format(identity))
+        if item.get("status") not in NATIVE_WORKER_STATUSES:
+            raise WorkerError("native worker status is invalid: {}".format(item.get("status")))
+        if item.get("workload") not in WORKLOADS:
+            raise WorkerError("native worker workload must be light, standard, or heavy")
+        identities.add(identity)
+        normalized_native.append({"id": identity, "status": str(item["status"]), "workload": str(item["workload"])})
+    managed_id_set = {_validate_identity(value, "managed Claude worker id") for value in managed_claude_ids}
+    collision = identities & managed_id_set
+    if collision:
+        raise WorkerError("Orchestration identities collide with managed Claude workers: {}".format(", ".join(sorted(collision))))
+    parent_ids = identities | managed_id_set
+    normalized_reviewers: List[Dict[str, str]] = []
+    for index, item in enumerate(reviewers):
+        if not isinstance(item, dict):
+            raise WorkerError("direct_reviewers[{}] must be an object".format(index))
+        _require_exact_keys(item, {"id", "status", "workload", "parent_id"}, set(), "direct_reviewers[{}]".format(index))
+        identity = _validate_identity(item.get("id"), "direct_reviewers[{}].id".format(index))
+        if identity in identities or identity in managed_id_set:
+            raise WorkerError("Duplicate orchestration identity: {}".format(identity))
+        if item.get("status") not in REVIEWER_STATUSES:
+            raise WorkerError("direct reviewer status must be reserved or running")
+        if item.get("workload") not in WORKLOADS:
+            raise WorkerError("direct reviewer workload must be light, standard, or heavy")
+        parent_id = _validate_identity(item.get("parent_id"), "direct_reviewers[{}].parent_id".format(index))
+        if parent_id not in parent_ids:
+            raise WorkerError("direct reviewer parent is not the controller, a native worker, or a managed Claude worker: {}".format(parent_id))
+        identities.add(identity)
+        normalized_reviewers.append({"id": identity, "status": str(item["status"]), "workload": str(item["workload"]), "parent_id": parent_id})
+    reason = raw.get("no_further_useful_native_lanes")
+    if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+        raise WorkerError("no_further_useful_native_lanes must be a non-empty reason string")
+    return {
+        "schema_version": ORCHESTRATION_STATE_VERSION,
+        "captured_at": captured.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(),
+        "age_seconds_at_validation": round(max(0.0, age), 3),
+        "freshness_validated_at": current.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(),
+        "assertion_source": "parent_codex",
+        "verification": "unverified_parent_assertion",
+        "native_child_limit": limit,
+        "controller": {"id": controller_id, "mode": str(controller["mode"]), "workload": str(controller["workload"])},
+        "native_workers": normalized_native,
+        "direct_reviewers": normalized_reviewers,
+        "no_further_useful_native_lanes": reason.strip() if isinstance(reason, str) else None,
+    }
+
+
+def load_orchestration_state(path_value: str, *, managed_claude_ids: Sequence[str] = ()) -> Dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise WorkerError("Orchestration state file does not exist: {}".format(path))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise WorkerError("Orchestration state is not readable JSON: {}".format(path)) from exc
+    value = validate_orchestration_state(raw, managed_claude_ids=managed_claude_ids)
+    value["path"] = str(path)
+    value["digest"] = digest_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+    return value
 
 
 def manifest_path(worker_id: str) -> Path:
@@ -573,8 +906,8 @@ def manifest_path(worker_id: str) -> Path:
 
 def _migrate_manifest(value: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     changed = False
-    if int(value.get("manifest_version", 1)) < MANIFEST_VERSION:
-        value["manifest_version"] = MANIFEST_VERSION
+    original_version = int(value.get("manifest_version", 1))
+    if original_version < 2:
         value.setdefault("attempt", 0)
         value.setdefault("attempt_history", [])
         value.setdefault("messages", [])
@@ -583,6 +916,14 @@ def _migrate_manifest(value: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         value.setdefault("session_registered", bool(value.get("turns_completed", 0)))
         value.setdefault("migration", {})
         changed = True
+        value.setdefault("migration", {})["v2_at"] = value.get("migration", {}).get("v2_at") or utc_now()
+    if original_version < 3:
+        value.setdefault("orchestration_state_receipt", None)
+        value.setdefault("capacity_receipt_schema", 1 if value.get("capacity_at_spawn") else None)
+        value.setdefault("migration", {})["v3_at"] = value.get("migration", {}).get("v3_at") or utc_now()
+        changed = True
+    if original_version < MANIFEST_VERSION:
+        value["manifest_version"] = MANIFEST_VERSION
     disposition = str(value.get("result_disposition") or "pending")
     terminal_receipt = bool(value.get("result_path") and Path(str(value["result_path"])).is_file())
     explicitly_final = disposition in {"rejected", "cancelled", "integrated", "retained"}
@@ -591,8 +932,6 @@ def _migrate_manifest(value: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         value["state"] = "cold_paused"
         value.setdefault("blocker", {"kind": "legacy_pause", "detail": "migrated from legacy stopped"})
         changed = True
-    if changed:
-        value.setdefault("migration", {})["v2_at"] = value.get("migration", {}).get("v2_at") or utc_now()
     return value, changed
 
 
@@ -649,9 +988,8 @@ def process_identity(pid: int) -> Dict[str, Any]:
     }
 
 
-def active_claude_weight(exclude_worker_id: Optional[str] = None) -> Tuple[float, int]:
-    cpu = 0.0
-    count = 0
+def active_claude_inventory(exclude_worker_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    values: List[Dict[str, Any]] = []
     for manifest in all_manifests():
         if exclude_worker_id and manifest.get("worker_id") == exclude_worker_id:
             continue
@@ -660,25 +998,88 @@ def active_claude_weight(exclude_worker_id: Optional[str] = None) -> Tuple[float
             continue
         profile = WORKLOADS.get(str(manifest.get("workload")), WORKLOADS["standard"])
         multiplier = 0.25 if state == "warm_paused" else 1.0
-        cpu += float(profile["cpu"]) * multiplier
-        count += 1
-    return cpu, count
+        values.append({
+            "id": str(manifest.get("worker_id")),
+            "state": state,
+            "workload": str(manifest.get("workload", "standard")),
+            "base_resource_weight": float(profile["cpu"]),
+            "resource_weight": float(profile["cpu"]) * multiplier,
+            "warm_paused": state == "warm_paused",
+        })
+    return values
+
+
+def _idle_weight(workload: str) -> float:
+    return float(WORKLOADS[workload]["cpu"]) * 0.25
+
+
+def orchestration_resource_accounting(
+    state: Dict[str, Any],
+    claude_workers: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    running_reviewer_parents = {
+        item["parent_id"] for item in state["direct_reviewers"] if item["status"] == "running"
+    }
+    controller = dict(state["controller"])
+    controller["resource_weight"] = float(WORKLOADS[controller["workload"]]["cpu"])
+    if controller["id"] in running_reviewer_parents:
+        controller["resource_weight"] = _idle_weight(controller["workload"])
+        controller["blocked_on_running_reviewer"] = True
+    native: List[Dict[str, Any]] = []
+    for raw in state["native_workers"]:
+        item = dict(raw)
+        full = float(WORKLOADS[item["workload"]]["cpu"])
+        item["resource_weight"] = full if item["status"] in {"starting", "running"} else _idle_weight(item["workload"])
+        if item["id"] in running_reviewer_parents:
+            item["resource_weight"] = _idle_weight(item["workload"])
+            item["blocked_on_running_reviewer"] = True
+        native.append(item)
+    claude: List[Dict[str, Any]] = []
+    for raw in claude_workers:
+        item = dict(raw)
+        if item["id"] in running_reviewer_parents:
+            item["resource_weight"] = _idle_weight(item["workload"])
+            item["blocked_on_running_reviewer"] = True
+        claude.append(item)
+    reviewers: List[Dict[str, Any]] = []
+    for raw in state["direct_reviewers"]:
+        item = dict(raw)
+        multiplier = 0.5 if item["status"] == "reserved" else 1.0
+        item["resource_weight"] = float(WORKLOADS[item["workload"]]["cpu"]) * multiplier
+        reviewers.append(item)
+    components = {
+        "controller": round(float(controller["resource_weight"]), 3),
+        "native_workers": round(sum(float(item["resource_weight"]) for item in native), 3),
+        "claude_workers": round(sum(float(item["resource_weight"]) for item in claude), 3),
+        "direct_reviewers": round(sum(float(item["resource_weight"]) for item in reviewers), 3),
+    }
+    return {
+        "controller": controller,
+        "native_workers": native,
+        "claude_workers": claude,
+        "direct_reviewers": reviewers,
+        "components": components,
+        "total": round(sum(components.values()), 3),
+        "units": "standard_inference_lane_equivalents",
+    }
 
 
 def calculate_capacity(
     snapshot: Dict[str, Any],
     *,
-    native_active: int,
+    orchestration_state: Dict[str, Any],
     workload: str,
     max_total_worker_lanes: Optional[int] = None,
     excluded_claude_worker_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     profile = WORKLOADS[workload]
-    active_cpu, active_claude = active_claude_weight(excluded_claude_worker_id)
+    claude_inventory = active_claude_inventory(excluded_claude_worker_id)
+    resources = orchestration_resource_accounting(orchestration_state, claude_inventory)
+    active_claude = len(claude_inventory)
+    native_active = len(orchestration_state["native_workers"])
     performance = max(1, int(snapshot["performance_cores"]))
-    logical = max(1, int(snapshot["logical_cores"]))
     cpu_budget = performance * 0.8
-    by_cpu = max(0, int(math.floor((cpu_budget - active_cpu - float(native_active)) / float(profile["cpu"]))))
+    by_cpu = max(0, int(math.floor((cpu_budget - float(resources["total"])) / float(profile["cpu"]))))
     reserve_memory = int(snapshot["total_memory_bytes"] * 0.2)
     memory_headroom = max(0, int(snapshot["available_memory_bytes"]) - reserve_memory)
     by_memory = max(0, int(memory_headroom // int(float(profile["memory_gib"]) * 1024**3)))
@@ -687,13 +1088,9 @@ def calculate_capacity(
     by_absolute = max(0, absolute_ceiling - current_count)
     safe = min(by_cpu, by_memory, by_absolute)
     gates: List[str] = []
-    load_ratio = float(snapshot["load1"]) / float(logical)
-    if load_ratio >= 0.9:
+    if snapshot.get("sustained_critical_cpu"):
         safe = 0
-        gates.append("critical_load")
-    elif load_ratio >= 0.7:
-        safe = min(safe, 1)
-        gates.append("elevated_load")
+        gates.append("sustained_critical_cpu")
     disk_gib = float(snapshot["disk_free_bytes"]) / 1024**3
     if disk_gib < 10:
         safe = 0
@@ -715,10 +1112,28 @@ def calculate_capacity(
     else:
         safe = safe_before_human_ceiling
     return {
+        "capacity_receipt_schema": 2,
         "safe_additional_this_wave": max(0, safe),
-        "native_active": native_active,
-        "active_claude": active_claude,
-        "active_claude_weight": active_cpu,
+        "lane_accounting": {
+            "controller": {"id": orchestration_state["controller"]["id"], "included_in_worker_lane_count": False},
+            "native_workers": native_active,
+            "managed_claude_workers": active_claude,
+            "direct_reviewers": len(orchestration_state["direct_reviewers"]),
+            "direct_reviewers_included_in_worker_lane_count": False,
+            "total_worker_lanes": current_count,
+        },
+        "resource_accounting": resources,
+        "orchestration_state": {
+            "schema_version": orchestration_state["schema_version"],
+            "captured_at": orchestration_state["captured_at"],
+            "age_seconds_at_validation": orchestration_state["age_seconds_at_validation"],
+            "assertion_source": orchestration_state["assertion_source"],
+            "verification": orchestration_state["verification"],
+            "path": orchestration_state.get("path"),
+            "digest": orchestration_state.get("digest"),
+            "native_child_limit": orchestration_state["native_child_limit"],
+            "no_further_useful_native_lanes": orchestration_state.get("no_further_useful_native_lanes"),
+        },
         "current_count": current_count,
         "excluded_claude_worker_id": excluded_claude_worker_id,
         "workload": workload,
@@ -745,12 +1160,6 @@ def calculate_capacity(
         "machine": snapshot,
         "recorded_at": utc_now(),
     }
-
-
-def annotate_capacity_receipt(result: Dict[str, Any], deprecated_alias_used: bool) -> Dict[str, Any]:
-    result["deprecated_alias_used"] = deprecated_alias_used
-    result["notices"] = [DEPRECATED_MAX_WORKERS_NOTICE] if deprecated_alias_used else []
-    return result
 
 
 def contains_subscription_limit(text: str) -> bool:
@@ -831,6 +1240,7 @@ For a required review, inspect the full reviewer output and access/coverage disc
 Do not change authentication, billing, providers, Claude settings, or usage-credit preferences.
 Do not accept any offer to continue with API credits, usage credits, or extra usage. Stop and report SUBSCRIPTION_LIMIT instead unless the task packet records a human-authorized per-worker exception.
 Follow the declared filesystem, network, tool, and external-action authority exactly. Report unavailable capabilities as blockers; never bypass controls.
+Honor the parent-assigned local-work window. Do not overlap a standard or heavy local test/build with another controller, native-worker, Claude-worker, or direct-reviewer job unless the human explicitly overrides the shared scheduling policy; light checks may overlap.
 Return only the requested structured result. Include changed files, tests and exit codes, blockers, branch/worktree/HEAD, proposed subtasks, lingering processes, and review receipts when applicable. Do not leave background processes running.
 """.format(
         worker_id=worker_id,
@@ -1117,6 +1527,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         "runner": RUNNER.is_file(),
         "gpt_second_opinion_skill": str(reviewer_skill) if reviewer_skill else None,
         "gpt_reviewer_codex": shutil.which("codex"),
+        "orchestration_state_schema": ORCHESTRATION_STATE_VERSION,
+        "telemetry_features": telemetry_features(),
         "machine": machine_snapshot(cwd),
     })
     if args.reconcile:
@@ -1140,16 +1552,22 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if not problems else 2
 
 
+def command_snapshot_template(args: argparse.Namespace) -> int:
+    emit(orchestration_state_template(args.native_child_limit))
+    return 0
+
+
 def command_capacity(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).expanduser().resolve()
-    result = annotate_capacity_receipt(
-        calculate_capacity(
-            machine_snapshot(cwd),
-            native_active=args.native_active,
-            workload=args.workload,
-            max_total_worker_lanes=args.max_total_worker_lanes,
-        ),
-        args.deprecated_max_workers_used,
+    orchestration_state = load_orchestration_state(
+        args.orchestration_state,
+        managed_claude_ids=[str(item.get("worker_id")) for item in all_manifests()],
+    )
+    result = calculate_capacity(
+        machine_snapshot(cwd),
+        orchestration_state=orchestration_state,
+        workload=args.workload,
+        max_total_worker_lanes=args.max_total_worker_lanes,
     )
     emit(result)
     return 0 if result["safe_additional_this_wave"] > 0 else 3
@@ -1166,8 +1584,18 @@ def command_spawn(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).expanduser().resolve()
     if not cwd.is_dir():
         raise WorkerError("Task working directory does not exist")
-    if args.activation == "maximal" and args.native_free_slots > 0:
-        raise WorkerError("Native Codex slots must be filled before maximal-parallelism Claude workers")
+    orchestration_state = load_orchestration_state(
+        args.orchestration_state,
+        managed_claude_ids=[str(item.get("worker_id")) for item in all_manifests()],
+    )
+    native_occupied = len(orchestration_state["native_workers"])
+    native_free_slots = max(0, int(orchestration_state["native_child_limit"]) - native_occupied)
+    no_more_native_reason = orchestration_state.get("no_further_useful_native_lanes")
+    if args.activation == "maximal" and native_free_slots > 0 and not no_more_native_reason:
+        raise WorkerError(
+            "Native Codex slots must be filled before maximal-parallelism Claude workers; "
+            "otherwise record no_further_useful_native_lanes in the orchestration state"
+        )
     auth, cache = require_ready_billing(cwd)
     executable = claude_path()
     help_text = run([executable, "--help"], cwd=cwd, timeout=10, check=True).stdout
@@ -1185,14 +1613,11 @@ def command_spawn(args: argparse.Namespace) -> int:
     worker_id = new_worker_id(args.name)
     decision = billing_decision(worker_id, model, effort, args.allow_usage_credits, args.usage_credit_authorization)
     with state_lock():
-        capacity = annotate_capacity_receipt(
-            calculate_capacity(
-                machine_snapshot(cwd),
-                native_active=args.native_active,
-                workload=args.workload,
-                max_total_worker_lanes=args.max_total_worker_lanes,
-            ),
-            args.deprecated_max_workers_used,
+        capacity = calculate_capacity(
+            machine_snapshot(cwd),
+            orchestration_state=orchestration_state,
+            workload=args.workload,
+            max_total_worker_lanes=args.max_total_worker_lanes,
         )
         if capacity["safe_additional_this_wave"] < 1:
             raise CapacityRefused(capacity)
@@ -1222,11 +1647,22 @@ def command_spawn(args: argparse.Namespace) -> int:
             "cwd": str(cwd),
             "workspace": {"mode": isolation, "cwd": str(cwd), "worktree": None},
             "activation": args.activation,
-            "native_occupancy_receipt": {"active": args.native_active, "free_slots": args.native_free_slots, "at": utc_now()},
+            "orchestration_state_receipt": capacity["orchestration_state"],
+            "native_occupancy_receipt": {
+                "occupied": native_occupied,
+                "child_limit": orchestration_state["native_child_limit"],
+                "free_slots": native_free_slots,
+                "no_further_useful_native_lanes": no_more_native_reason,
+                "assertion_source": "parent_codex",
+                "verification": "unverified_parent_assertion",
+                "at": utc_now(),
+            },
             "orchestration_policy": {
-                "overflow_mode": args.native_free_slots == 0,
-                "primary_codex_role_default": "orchestrator_only" if args.native_free_slots == 0 else "orchestrator_or_worker",
-                "material_primary_lane_requires_human_override": args.native_free_slots == 0,
+                "overflow_mode": native_free_slots == 0 or bool(no_more_native_reason),
+                "primary_codex_role_default": "orchestrator_only" if native_free_slots == 0 or no_more_native_reason else "orchestrator_or_worker",
+                "material_primary_lane_requires_human_override": native_free_slots == 0 or bool(no_more_native_reason),
+                "reported_controller_mode": orchestration_state["controller"]["mode"],
+                "local_work_scheduling": "one_standard_or_heavy_test_or_build_at_a_time_across_all_roles",
             },
             "model": model,
             "effort": effort,
@@ -1261,12 +1697,10 @@ def command_spawn(args: argparse.Namespace) -> int:
                 "raw_agent_harnesses": "denied_except_constrained_gpt_review",
             },
             "capacity_at_spawn": capacity,
+            "capacity_receipt_schema": 2,
             "result_disposition": "pending",
             "blocker": None,
-            "notices": (
-                ([discovery["notice"]] if discovery.get("notice") else [])
-                + ([DEPRECATED_MAX_WORKERS_NOTICE] if args.deprecated_max_workers_used else [])
-            ),
+            "notices": [discovery["notice"]] if discovery.get("notice") else [],
         }
         manifest.update({key: str(value) for key, value in paths.items()})
         save_manifest(manifest)
@@ -1385,23 +1819,19 @@ def command_send(args: argparse.Namespace) -> int:
 
 def capacity_for_resume(
     manifest: Dict[str, Any],
-    native_active: int,
+    orchestration_state: Dict[str, Any],
     max_total_worker_lanes: Optional[int],
-    deprecated_alias_used: bool,
     retry_seconds: float,
     retry_interval: float,
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + retry_seconds
     while True:
-        capacity = annotate_capacity_receipt(
-            calculate_capacity(
-                machine_snapshot(Path(str(manifest["cwd"]))),
-                native_active=native_active,
-                workload=str(manifest.get("workload", "standard")),
-                max_total_worker_lanes=max_total_worker_lanes,
-                excluded_claude_worker_id=str(manifest["worker_id"]),
-            ),
-            deprecated_alias_used,
+        capacity = calculate_capacity(
+            machine_snapshot(Path(str(manifest["cwd"]))),
+            orchestration_state=orchestration_state,
+            workload=str(manifest.get("workload", "standard")),
+            max_total_worker_lanes=max_total_worker_lanes,
+            excluded_claude_worker_id=str(manifest["worker_id"]),
         )
         if capacity["safe_additional_this_wave"] >= 1:
             return capacity
@@ -1427,9 +1857,8 @@ def activate_manifest(manifest: Dict[str, Any], args: argparse.Namespace, *, con
     require_ready_billing(Path(str(manifest["cwd"])))
     capacity = capacity_for_resume(
         manifest,
-        args.native_active,
+        args.orchestration_snapshot,
         args.max_total_worker_lanes,
-        args.deprecated_max_workers_used,
         args.capacity_retry_seconds,
         args.capacity_retry_interval,
     )
@@ -1444,6 +1873,10 @@ def activate_manifest(manifest: Dict[str, Any], args: argparse.Namespace, *, con
 
 
 def command_followup(args: argparse.Namespace) -> int:
+    args.orchestration_snapshot = load_orchestration_state(
+        args.orchestration_state,
+        managed_claude_ids=[str(item.get("worker_id")) for item in all_manifests()],
+    )
     manifest, message = queue_message(args.worker_id, read_message(args), "followup")
     receipt = activate_manifest(manifest, args, continuation=False)
     emit({"worker_id": args.worker_id, "message": message, "receipt": receipt})
@@ -1468,6 +1901,10 @@ def command_pause(args: argparse.Namespace) -> int:
 
 
 def command_resume(args: argparse.Namespace) -> int:
+    args.orchestration_snapshot = load_orchestration_state(
+        args.orchestration_state,
+        managed_claude_ids=[str(item.get("worker_id")) for item in all_manifests()],
+    )
     manifest = reconcile_manifest(load_manifest(args.worker_id))
     if manifest.get("state") in {"stopped", "cancelled"}:
         raise WorkerError("A permanently stopped worker cannot be resumed")
@@ -1656,22 +2093,8 @@ def nonnegative_int(raw: str) -> int:
     return value
 
 
-class DeprecatedMaxWorkersAction(argparse.Action):
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Any,
-        option_string: Optional[str] = None,
-    ) -> None:
-        setattr(namespace, self.dest, values)
-        setattr(namespace, "deprecated_max_workers_used", True)
-
-
 def add_total_worker_lane_ceiling_arg(parser: argparse.ArgumentParser) -> None:
-    parser.set_defaults(deprecated_max_workers_used=False)
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
+    parser.add_argument(
         "--max-total-worker-lanes",
         dest="max_total_worker_lanes",
         type=nonnegative_int,
@@ -1681,18 +2104,10 @@ def add_total_worker_lane_ceiling_arg(parser: argparse.ArgumentParser) -> None:
             "excludes the primary Codex orchestrator"
         ),
     )
-    group.add_argument(
-        "--max-workers",
-        dest="max_total_worker_lanes",
-        type=nonnegative_int,
-        action=DeprecatedMaxWorkersAction,
-        metavar="N",
-        help="deprecated alias for --max-total-worker-lanes",
-    )
 
 
 def add_activation_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--native-active", type=nonnegative_int, required=True)
+    parser.add_argument("--orchestration-state", required=True)
     add_total_worker_lane_ceiling_arg(parser)
     parser.add_argument("--capacity-retry-seconds", type=float, default=300)
     parser.add_argument("--capacity-retry-interval", type=float, default=30)
@@ -1706,17 +2121,19 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--cwd", required=True)
     doctor.add_argument("--reconcile", action="store_true")
     doctor.set_defaults(func=command_doctor)
+    snapshot_template = subparsers.add_parser("snapshot-template")
+    snapshot_template.add_argument("--native-child-limit", type=nonnegative_int, required=True)
+    snapshot_template.set_defaults(func=command_snapshot_template)
     capacity = subparsers.add_parser("capacity")
     capacity.add_argument("--cwd", required=True)
-    capacity.add_argument("--native-active", type=nonnegative_int, required=True)
+    capacity.add_argument("--orchestration-state", required=True)
     capacity.add_argument("--workload", choices=sorted(WORKLOADS), default="standard")
     add_total_worker_lane_ceiling_arg(capacity)
     capacity.set_defaults(func=command_capacity)
     spawn = subparsers.add_parser("spawn")
     spawn.add_argument("--cwd", required=True)
     spawn.add_argument("--activation", choices=("maximal", "explicit-claude"), required=True)
-    spawn.add_argument("--native-active", type=nonnegative_int, required=True)
-    spawn.add_argument("--native-free-slots", type=nonnegative_int, required=True)
+    spawn.add_argument("--orchestration-state", required=True)
     spawn.add_argument("--codex-model")
     spawn.add_argument("--codex-effort", choices=sorted(EFFORTS))
     spawn.add_argument("--model")

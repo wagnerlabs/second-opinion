@@ -45,7 +45,7 @@ Resolve the helper relative to this `SKILL.md` and run:
 python3 <skill-directory>/scripts/claude_worker.py doctor --cwd <task-repository> --reconcile
 ```
 
-`doctor --reconcile` verifies the installed streaming features, current first-party subscription login, prohibited provider overrides, machine state, state migration, skill-owned process recovery, and discovery of `/gpt-second-opinion`. Reconcile again before a later capacity calculation if a managed supervisor exited unexpectedly after preflight. A missing reviewer skill does not block ordinary workers, but it blocks any task that requires that review.
+`doctor --reconcile` verifies the installed streaming features, current first-party subscription login, prohibited provider overrides, sampled-telemetry sources, machine state, state migration, skill-owned process recovery, and discovery of `/gpt-second-opinion`. Reconcile again before a later capacity calculation if a managed supervisor exited unexpectedly after preflight. A missing reviewer skill does not block ordinary workers, but it blocks any task that requires that review.
 
 Resolve `claude` from the current user's `PATH`. For a nonstandard installation, set `CLAUDE_WORKER_CLAUDE` to that user's Claude Code executable; never embed a user- or machine-specific fallback path.
 
@@ -56,26 +56,63 @@ If `notices` reports an Opus version newer than Opus 5, tell the human promptly.
 1. Decompose the request into independent ownership lanes.
 2. Inspect the current native Codex agent tree immediately before launch.
 3. Fill useful native slots first unless Claude was explicitly requested.
-4. Run `capacity` with the fresh active-native count and workload.
-5. Before adding Claude beyond a full native pool, move any material primary-agent lane to a worker and make the primary agent orchestration-only.
-6. Add Claude workers in waves of no more than two; recheck after every wave.
+4. Create a fresh orchestration-state snapshot that classifies the controller, native workers, and direct reviewers separately.
+5. Run `capacity` with the snapshot and prospective workload.
+6. Before adding Claude beyond a full native pool, move any material primary-agent lane to a worker and make the primary agent orchestration-only.
+7. Add Claude workers in waves of no more than two; recheck after every wave.
+
+Generate a valid starting document, update it to reflect the live agent tree, and save it outside the repository unless it belongs to the user's deliverable:
+
+```sh
+python3 <skill-directory>/scripts/claude_worker.py snapshot-template \
+  --native-child-limit <native-child-limit> \
+  > /tmp/claude-worker-orchestration-state.json
+```
+
+The schema is strict:
+
+```json
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-10T00:00:00+00:00",
+  "native_child_limit": 3,
+  "controller": {"id": "primary-codex", "mode": "orchestrator_only", "workload": "light"},
+  "native_workers": [
+    {"id": "worker-one", "status": "running", "workload": "standard"}
+  ],
+  "direct_reviewers": [
+    {"id": "review-one", "status": "reserved", "workload": "heavy", "parent_id": "worker-one"}
+  ],
+  "no_further_useful_native_lanes": "optional reason unused native slots cannot form useful independent lanes"
+}
+```
+
+Use controller mode `orchestrator_only` or `orchestrator_and_worker`. Use native status `starting`, `running`, `idle`, `blocked`, `review_blocked`, or `paused`. Use direct-reviewer status `reserved` or `running`. Workloads are `light`, `standard`, or `heavy`. IDs must be stable and unique across roles. A reviewer parent must be the controller, a listed native worker, or a skill-managed Claude worker.
+
+Refresh `captured_at` and the live role lists immediately before every `capacity`, `spawn`, `followup`, or `resume`. The helper validates the snapshot once at command start, accepts at most 60 seconds of age and five seconds of future clock skew, and labels it as an unverified parent assertion. It intentionally reuses that validated snapshot during a bounded resume-capacity retry instead of letting it expire mid-command.
 
 ```sh
 python3 <skill-directory>/scripts/claude_worker.py capacity \
   --cwd <task-repository> \
-  --native-active <fresh-count> \
+  --orchestration-state /tmp/claude-worker-orchestration-state.json \
   --workload standard
 ```
 
-Use `safe_additional_this_wave` as the machinery's recommendation for how many Claude workers may be added now, never as a requirement to fill every available place. It incorporates CPU, memory, load, disk, workload weight, active native lanes, active or warm skill-owned Claude lanes, an absolute machine guard, and a maximum launch wave of two. Recalculate after every wave and choose the smaller of the recommendation and the number of genuinely independent useful lanes.
+Use `safe_additional_this_wave` as the machinery's recommendation for how many Claude workers may be added now, never as a requirement to fill every available place. It incorporates three sampled CPU/disk intervals, memory, free disk, workload weight, controller/native/Claude/reviewer resource use, an absolute machine guard, and a maximum launch wave of two. Recalculate after every wave and choose the smaller of the recommendation and the number of genuinely independent useful lanes.
 
-`--max-total-worker-lanes N` is an optional human/operator hard ceiling, not the recommendation algorithm. Pass the fresh caller-observed native lane count through `--native-active`; the helper adds active or warm skill-owned Claude worker lanes and excludes the primary Codex orchestrator, cold-paused Claude lanes, and unrelated external processes. The ceiling can lower the machine-derived allowance but can never raise it. It is per invocation, so pass it on every `capacity`, `spawn`, `followup`, or `resume` command where the human wants it enforced. `--max-workers` remains only as a deprecated compatibility alias; receipts identify use of that alias and direct the caller to the current name.
+`--max-total-worker-lanes N` is an optional human/operator hard ceiling, not the recommendation algorithm. The helper counts listed native workers plus active or warm skill-owned Claude workers. It excludes the primary controller, direct reviewers, cold-paused Claude workers, and unrelated external processes. The ceiling can lower the machine-derived allowance but can never raise it. It is per invocation, so pass it on every `capacity`, `spawn`, `followup`, or `resume` command where the human wants it enforced. This is a breaking interface: `--native-active`, `--native-free-slots`, and `--max-workers` are invalid; never synthesize manual counts for them.
 
-Read `human_ceiling` in the capacity receipt for `supplied_max_total_worker_lanes`, `current_count`, `remaining_capacity`, `safe_without_human_ceiling`, `binding`, and `reduced_capacity`. `binding` means remaining capacity under the ceiling is at or below the otherwise-safe recommendation; `reduced_capacity` means it is strictly lower. The `human_ceiling` gate appears when the ceiling is binding, including equality. The top-level `current_count` is the combined native-plus-Claude lane count used in this arithmetic. On a refused `spawn`, read the structured stderr JSON's `capacity` object instead of parsing the human-readable `error` string.
+Read `lane_accounting`, `resource_accounting`, and `human_ceiling` in the capacity receipt. Lane accounting separates controller, native, managed-Claude, reviewer, and total-worker-lane classifications. Resource accounting shows each role's inference-equivalent weight. Reserved direct reviewers contribute half their workload weight; running reviewers contribute full weight and reduce their synchronously blocked parent to idle weight. Reviewers consume resources without consuming top-level worker-lane ceiling positions.
+
+`human_ceiling` reports `supplied_max_total_worker_lanes`, `current_count`, `remaining_capacity`, `safe_without_human_ceiling`, `binding`, and `reduced_capacity`. `binding` means remaining capacity under the ceiling is at or below the otherwise-safe recommendation; `reduced_capacity` means it is strictly lower. On a refused `spawn`, read structured stderr JSON's `capacity` object instead of parsing the human-readable `error` string.
+
+On Apple Silicon, telemetry uses feature-detected `iostat`, `vm_stat` or `memory_pressure`, and `sysctl`, with a ten-second persistent cache shared by related commands. A new inference lane is blocked for CPU only when at least two of three samples are at or above 95 percent. One spike and moderate utilization remain advisory. Disk activity is sampled and reported but is not a throughput gate; free-disk gates remain. Linux uses `/proc` sampling when available and receives no platform-specific wave penalty.
 
 Capacity is a ceiling, not a target. Consider build-cache contention, mutable-path overlap, and subscription headroom in addition to the calculated machine signals. On a 16-core/128 GB Mac Studio, a huge number of workers will contend rather than accelerate.
 
 Warm-paused Claude processes consume 0.25 workload weight for CPU budgeting but still occupy one lane under the absolute and optional total-lane ceilings. Cold-paused processes count as zero.
+
+Until measured evidence justifies automatic local-work admission, schedule at most one standard or heavy local test/build at a time across the primary controller, native Codex workers, Claude workers, and direct reviewers. Light checks may overlap. Put the assigned local-work window in each task packet or steering message. Apply this parent-owned rule equally to every role; do not add a Claude-only wrapper or hook. Automatic queuing is deliberately deferred until at least two overflow runs show overlapping local work with sustained sampled CPU of at least 90 percent or at least a 25 percent duration slowdown.
 
 ## Select model and effort
 
@@ -153,7 +190,7 @@ Shared working directory is the default, matching native Codex workers. Native w
 
 If overlapping mutation needs a worktree and the directory is not a Git repository, launch fails rather than risking overlap.
 
-The task must state objective, owned paths, dependencies, forbidden actions, required tests, and completion criteria. Do not assign overlapping mutable ownership.
+The task must state objective, owned paths, dependencies, forbidden actions, required tests, completion criteria, and whether/when the lane owns the one shared standard-or-heavy local-work window. Do not assign overlapping mutable ownership.
 
 If a second opinion is required, also include the complete verbatim user transcript available to the parent, the review scenario, the concrete target, every critical/load-bearing material path, and the artifact under review. Do not make the Claude worker reconstruct context that only the parent possesses.
 
@@ -177,8 +214,7 @@ Pass the task on stdin:
 python3 <skill-directory>/scripts/claude_worker.py spawn \
   --cwd <task-repository> \
   --activation maximal \
-  --native-active <fresh-count> \
-  --native-free-slots 0 \
+  --orchestration-state /tmp/claude-worker-orchestration-state.json \
   --codex-model gpt-5.6-sol \
   --codex-effort xhigh \
   --codex-approval-policy never \
@@ -191,7 +227,7 @@ python3 <skill-directory>/scripts/claude_worker.py spawn \
   < <task-file>
 ```
 
-Use `--activation explicit-claude` when the human directly requested Claude. Record real native counts even then.
+Use `--activation explicit-claude` when the human directly requested Claude. Record the real controller, native-worker, and direct-reviewer roles even then. For `maximal`, the helper refuses unused native capacity unless the snapshot includes a concrete `no_further_useful_native_lanes` reason.
 
 Spawn does not return ready until the supervisor has created its private socket, validated Claude's session ID, and completed a five-second no-work `get_context_usage` protocol probe. It returns the worker ID, stable session ID, authority receipt, billing decision, capacity receipt, protocol receipt, and orchestration policy. When that receipt reports `overflow_mode: true`, treat `primary_codex_role_default: orchestrator_only` as an operating commitment, not merely metadata.
 
@@ -205,9 +241,9 @@ python3 <skill-directory>/scripts/claude_worker.py logs <worker-id>
 python3 <skill-directory>/scripts/claude_worker.py attach <worker-id>
 python3 <skill-directory>/scripts/claude_worker.py wait <worker-id>
 python3 <skill-directory>/scripts/claude_worker.py send <worker-id> --message '<steering>'
-python3 <skill-directory>/scripts/claude_worker.py followup <worker-id> --native-active <count> --message '<new turn>'
+python3 <skill-directory>/scripts/claude_worker.py followup <worker-id> --orchestration-state <fresh-snapshot> --message '<new turn>'
 python3 <skill-directory>/scripts/claude_worker.py pause <worker-id>
-python3 <skill-directory>/scripts/claude_worker.py resume <worker-id> --native-active <count>
+python3 <skill-directory>/scripts/claude_worker.py resume <worker-id> --orchestration-state <fresh-snapshot>
 python3 <skill-directory>/scripts/claude_worker.py stop <worker-id>
 python3 <skill-directory>/scripts/claude_worker.py approve <worker-id> <permission-id> --reason '<basis>'
 python3 <skill-directory>/scripts/claude_worker.py deny <worker-id> <permission-id> --reason '<basis>'
