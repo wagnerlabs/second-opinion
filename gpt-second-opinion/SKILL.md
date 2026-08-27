@@ -1,6 +1,6 @@
 ---
 name: gpt-second-opinion
-description: "Sends a blocking, time-expensive review packet to GPT-5.6-Sol via Codex CLI at maximum reasoning effort and OpenAI fast mode by default, inspecting the repo in a read-only sandbox. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. Primarily for non-OpenAI agents; GPT/OpenAI agents should prefer claude-second-opinion for perspective diversity unless the user requests GPT or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
+description: "Sends a blocking, time-expensive review packet to GPT-5.6-Sol via Codex CLI at maximum reasoning effort and OpenAI fast mode by default, inspecting the repo in a read-only sandbox. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-OpenAI agents; GPT/OpenAI agents should prefer claude-second-opinion for perspective diversity unless the user requests GPT or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
 ---
 
 # GPT second opinion
@@ -18,6 +18,16 @@ description: "Sends a blocking, time-expensive review packet to GPT-5.6-Sol via 
 - Treat a zero exit code, a `REVIEW STATUS: COMPLETE` marker, or useful partial feedback as insufficient by itself. If GPT says it could not access or inspect any critical/load-bearing related material, the review failed operationally and must be repaired and rerun.
 - Treat the review as a second opinion, not an approval authority. A critical verdict, requested changes, unresolved recommendations, or your decision to reject some or all feedback does not keep the gate open.
 - Default frequency: at most one completed review per non-trivial task/artifact. Run again only to replace a pass that failed the execution/access/coverage gate, when the user explicitly requests another review, or for a materially different downstream artifact such as a completed implementation after a plan review. Never rerun a revised plan, implementation, document, or analysis merely to seek GPT's agreement, approval, or confirmation that feedback was addressed.
+
+## Primary-agent completion gate
+
+This gate applies before packet construction or reviewer invocation.
+
+- For work not already produced, independently complete the exact RCA, plan, implementation, analysis, document, or other artifact that will be reviewed. It must be your best attempt, with all normal in-scope work applicable to it—including investigation, reasoning, implementation, tests, and validation—already performed, and it must be ready to deliver or act on if no reviewer were available.
+- GPT is an independent reviewer, not a collaborative thought partner or a substitute for your work. Do not invoke it to brainstorm, draft, investigate, fill gaps, resolve placeholders, finish the artifact, or offset effort you should perform yourself. Never reduce your own effort because a second-opinion pass is expected.
+- If the user asks you to do something and then obtain a second opinion, finish that work to completion before invoking this skill. Do not split the work with GPT or send an intermediate attempt for GPT to complete.
+- If you already produced an artifact and the user then asks for a second opinion on that existing work, submit the existing artifact directly; do not recreate it merely to satisfy this gate. This exception does not permit preparing a new partial artifact when the requested sequence is to do the work and then review it.
+- For `independent-rca`, complete your own best RCA before invoking GPT, while continuing to omit that RCA from the packet so GPT's analysis remains independent. Consider reviewer feedback and make any revisions only after a valid review completes.
 
 ## Usage
 
@@ -55,11 +65,11 @@ Use one of these scenarios:
 
 | Scenario | When | What GPT does |
 |---|---|---|
-| `independent-rca` | After your own RCA, before fixing a bug | Performs its own independent RCA from scratch — does NOT see yours |
-| `plan-review` | After drafting a feature plan, before implementing | Reviews and critiques the plan |
-| `post-implementation-review` | After implementation, before finalizing | Reviews the changes against the plan or user requirements |
-| `document-review` | After drafting or revising a non-technical artifact (business doc, product analysis, strategy work, email, spec, etc.) | Performs its own independent analysis from the user's inputs, then compares against your output for fidelity, clarity, logic, completeness, and soundness |
-| `analysis-review` | After completing non-trivial analysis that will be returned as a substantial chat response, comment, recommendation, or similar output | Provides an independent second opinion on reasoning, assumptions, completeness, fidelity to the user's request, and actionability |
+| `independent-rca` | After completing your own best RCA, before fixing a bug | Performs its own independent RCA from scratch — does NOT see yours |
+| `plan-review` | After completing your best implementation-ready plan, before implementing | Reviews and critiques the plan |
+| `post-implementation-review` | After completing the implementation and your normal validation, before finalizing | Reviews the changes against the plan or user requirements |
+| `document-review` | After completing your best final-ready non-technical artifact (business doc, product analysis, strategy work, email, spec, etc.) | Performs its own independent analysis from the user's inputs, then compares against your output for fidelity, clarity, logic, completeness, and soundness |
+| `analysis-review` | After completing your best final-ready analysis for a substantial chat response, comment, recommendation, or similar output | Provides an independent second opinion on reasoning, assumptions, completeness, fidelity to the user's request, and actionability |
 
 ## Non-negotiables
 
@@ -145,6 +155,8 @@ All user-typed messages from this session, verbatim and in chronological order. 
 
 **Omit this entire section for `independent-rca`.** GPT must not see your analysis — it performs its own from scratch.
 
+For every artifact-bearing scenario, the artifact must be your complete best attempt: finished, normally validated, and ready to deliver or act on without GPT's help. Do not submit notes, exploratory work, partial drafts, unresolved placeholders, or requests for GPT to create or finish any part. When the user specifically requests review of an artifact you already produced, include that existing artifact directly as allowed by the primary-agent completion gate.
+
 - For `plan-review`: if the plan exists as a file on disk, provide only the file path (e.g., "See plan at `docs/plan.md`"). Do NOT copy, paste, or summarize the plan contents into this packet — GPT will read the file directly. Only inline the plan text if no plan file exists on disk.
 - For `post-implementation-review`: a short implementation summary, intended behavior, and the path to the plan markdown file if one exists (so GPT can read it). Do not copy plan contents into the packet. Do not include large diff excerpts unless strictly necessary.
 - For `document-review`: structure this section in two clearly labeled parts:
@@ -186,6 +198,7 @@ If structural validation fails, rewrite the packet from scratch at the same gene
 - **Accidentally included context** — attached context blocks, expanded @-mentions, inlined file contents, skill text, or git diffs that leaked into the user transcript.
 - **Agent claims framed as established facts** — factual claims, test results, or conclusions from the invoking agent that the review should independently verify but that the packet presents as trusted background.
 - **Bloat** — large code excerpts, diff dumps, or repository summaries that GPT doesn't need (it reads the repo directly).
+- **Premature handoff** — unless the user specifically requested review of an already-produced artifact, the target is partial, contains unresolved artifact-creation work you should complete, or asks GPT to develop or finish it.
 
 If any content issues are found, rewrite the packet from scratch at the same generated packet path — do not patch the file.
 
