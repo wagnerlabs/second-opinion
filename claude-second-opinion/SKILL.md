@@ -1,6 +1,6 @@
 ---
 name: claude-second-opinion
-description: "Sends a blocking, time-expensive review packet to Claude Fable 5 via CLI at max effort and standard speed by default, with user-requested fast mode and explicit Opus 5/Opus 4.8 options, inspecting the repo read-only. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-Anthropic agents; Claude/Anthropic agents should prefer gpt-second-opinion for perspective diversity unless the user requests Claude or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
+description: "Sends a blocking, time-expensive review packet to Claude Fable 5.1 via CLI at max effort and standard speed by default, with user-requested fast mode and explicit Fable 5, Opus 5, and Opus 4.8 options, inspecting the repo read-only. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-Anthropic agents; Claude/Anthropic agents should prefer gpt-second-opinion for perspective diversity unless the user requests Claude or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
 ---
 
 # Claude second opinion
@@ -54,15 +54,16 @@ If the completion gate fails:
 /claude-second-opinion [model] [effort] [--fast]
 ```
 
-- `/claude-second-opinion` — uses Fable 5 with `max` effort at standard speed (default)
-- `/claude-second-opinion --fast` — uses Fable 5 with `max` effort in fast mode
-- `/claude-second-opinion fable` — uses Fable 5 with `max` effort at standard speed
-- `/claude-second-opinion fable xhigh --fast` — uses Fable 5 with `xhigh` effort in fast mode
+- `/claude-second-opinion` — uses Fable 5.1 with `max` effort at standard speed (default)
+- `/claude-second-opinion --fast` — uses Fable 5.1 with `max` effort in fast mode
+- `/claude-second-opinion fable` — uses Fable 5.1 with `max` effort at standard speed
+- `/claude-second-opinion fable xhigh --fast` — uses Fable 5.1 with `xhigh` effort in fast mode
+- `/claude-second-opinion fable-5` — uses Fable 5 with `max` effort at standard speed
 - `/claude-second-opinion opus` — uses Opus 5 with `max` effort at standard speed
 - `/claude-second-opinion opus xhigh --fast` — uses Opus 5 with `xhigh` effort in fast mode
 - `/claude-second-opinion opus-4.8 --fast` — uses Opus 4.8 with `max` effort in fast mode
 
-Supported models are `fable` / `fable-5`, `opus` / `opus-5`, and `opus-4.8`. Supported effort values are `xhigh` and `max`. If you pass only an effort value, it applies to the default Fable 5 model.
+Supported models are `fable` / `fable-5.1` (Fable 5.1), `fable-5` (Fable 5), `opus` / `opus-5`, and `opus-4.8`. Supported effort values are `xhigh` and `max`. If you pass only an effort value, it applies to the default Fable 5.1 model.
 Fast mode is disabled by default. Pass `--fast` only when the user explicitly requests fast mode for that specific review; do not enable it at agent discretion. The skill passes the choice as a command-line session setting, so it does not change the caller's persistent Claude settings.
 For a requested fast run, the command also skips Claude Code's client-side fast-mode organization preflight. This lets setup-token and gateway users reach the authoritative Anthropic API check instead of receiving a false "disabled by your organization" result. The API still rejects fast requests when the organization actually disables them.
 
@@ -227,7 +228,7 @@ SCENARIO="independent-rca"  # set to: independent-rca, plan-review, post-impleme
 PACKET_PATH="/var/folders/.../claude-second-opinion.AbC123/packet.md"
 OUT_PATH="/var/folders/.../claude-second-opinion.AbC123/output.txt"
 
-MODEL="claude-fable-5"
+MODEL="claude-fable-5-1"
 EFFORT="max"
 FAST_MODE="false"
 FAST_MODE_OPTION_SEEN="false"
@@ -256,7 +257,7 @@ if [ -n "$CONFIG_ARG" ]; then
         elif [ -z "$EFFORT_ARG" ]; then
           EFFORT_ARG="$ARG"
         else
-          printf 'Unsupported claude-second-opinion arguments: %s\nUse no argument for Fable 5 max at standard speed, an effort only, "<model> <effort>", and optionally --fast when the user requests it.\n' "$CONFIG_ARG" >&2
+          printf 'Unsupported claude-second-opinion arguments: %s\nUse no argument for Fable 5.1 max at standard speed, an effort only, "<model> <effort>", and optionally --fast when the user requests it.\n' "$CONFIG_ARG" >&2
           exit 2
         fi
         ;;
@@ -274,12 +275,16 @@ if [ -n "$CONFIG_ARG" ]; then
       MODEL="claude-opus-4-8"
       EFFORT="${EFFORT_ARG:-max}"
       ;;
-    fable|fable-5|claude-fable-5)
+    fable|fable-5.1|fable-5-1|claude-fable-5.1|claude-fable-5-1)
+      MODEL="claude-fable-5-1"
+      EFFORT="${EFFORT_ARG:-max}"
+      ;;
+    fable-5|claude-fable-5)
       MODEL="claude-fable-5"
       EFFORT="${EFFORT_ARG:-max}"
       ;;
     xhigh|max)
-      MODEL="claude-fable-5"
+      MODEL="claude-fable-5-1"
       EFFORT="$MODEL_ARG"
       if [ -n "$EFFORT_ARG" ]; then
         printf 'Unsupported claude-second-opinion arguments: %s\nAn effort-only invocation accepts one effort value plus optional --fast.\n' "$CONFIG_ARG" >&2
@@ -287,7 +292,7 @@ if [ -n "$CONFIG_ARG" ]; then
       fi
       ;;
     *)
-      printf 'Unsupported claude-second-opinion model or effort: %s\nSupported models: opus, opus-5, opus-4.8, fable, fable-5. Supported efforts: xhigh, max.\n' "$MODEL_ARG" >&2
+      printf 'Unsupported claude-second-opinion model or effort: %s\nSupported models: opus, opus-5, opus-4.8, fable, fable-5.1, fable-5. Supported efforts: xhigh, max.\n' "$MODEL_ARG" >&2
       exit 2
       ;;
   esac
@@ -301,7 +306,9 @@ case "$EFFORT" in
     ;;
 esac
 
-if [ "$MODEL" = "claude-fable-5" ] && [ "$EFFORT" != "max" ]; then
+if [ "$MODEL" = "claude-fable-5-1" ] && [ "$EFFORT" != "max" ]; then
+  printf 'Warning: Fable 5.1 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
+elif [ "$MODEL" = "claude-fable-5" ] && [ "$EFFORT" != "max" ]; then
   printf 'Warning: Fable 5 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
 elif [ "$MODEL" = "claude-opus-5" ] && [ "$EFFORT" != "max" ]; then
   printf 'Warning: Opus 5 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
