@@ -19,6 +19,14 @@ description: "Sends a blocking, time-expensive review packet to Claude Fable 5.1
 - Treat the review as a second opinion, not an approval authority. A critical verdict, requested changes, unresolved recommendations, or your decision to reject some or all feedback does not keep the gate open.
 - Default frequency: at most one completed review per non-trivial task/artifact. Run again only to replace a pass that failed the execution/access/coverage gate, when the user explicitly requests another review, or for a materially different downstream artifact such as a completed implementation after a plan review. Never rerun a revised plan, implementation, document, or analysis merely to seek Claude's agreement, approval, or confirmation that feedback was addressed.
 
+## Reviewer default and per-review fallback
+
+- **Every new review defaults to Fable 5.1 at `max` effort and standard speed**, unless the user explicitly selects another supported model, effort, or fast mode for that review.
+- If Fable cannot be used for a particular review, use **Opus 5 as the fallback for that review only**. Base this decision on a concrete limitation affecting that review, such as model unavailability or an unsupported required capability; do not switch merely because Fable's feedback is unfavorable.
+- Select the fallback through the existing per-invocation arguments: `/claude-second-opinion opus` selects `claude-opus-5` at `max` effort and standard speed. Preserve any effort or fast-mode choice explicitly requested for that review. This is an agent-selected, case-by-case fallback, not an automatic retry on every command failure.
+- **Fallback is not sticky.** Do not change the skill's Fable 5.1 default, persistent Claude settings, or future-review routing. At the next review, start from Fable 5.1 again and assess any limitation afresh; a previous fallback is not permission to keep using Opus 5.
+- Briefly disclose why the fallback was needed and which model actually performed the review. Keep the same complete review scope, read-only restrictions, and review completion gate. Repair missing inputs or access problems rather than assuming a model switch fixes them. If neither reviewer can complete the review after safe, in-scope remediation, follow the stop-and-report rule.
+
 ## Primary-agent completion gate
 
 This gate applies before packet construction or reviewer invocation.
@@ -45,7 +53,7 @@ Exactly one `REVIEW STATUS: COMPLETE` marker and no `REVIEW STATUS: INCOMPLETE` 
 If the completion gate fails:
 
 1. Identify a concrete execution, access, packet, or review-coverage failure before rerunning. If that cause can be corrected without user input or new authority, fix it and rerun the second-opinion review. This is required, not optional. Examples include repairing the packet or prompt, correcting a scenario or path, provisioning already-authorized read-only access, adding missing primary material, or enabling a safe local validator inside the enforced read-only sandbox. Do not change the reviewed artifact merely to obtain a more favorable verdict, do not repeat an unchanged failing command, and validate the replacement output against this gate. Attempts required to obtain the first valid review do not count as additional discretionary reviews under the default-frequency rule.
-2. If Claude reviewed only part of the intended scope, treat the whole pass as incomplete. Repair and rerun it; do not fill the gap yourself and continue.
+2. If Claude reviewed only part of the intended scope, treat the whole pass as incomplete. Repair and rerun it; do not fill the gap yourself and continue. If the concrete failure prevents using Fable for this review, apply the per-review Opus 5 fallback above and validate the replacement review against the same completion gate.
 3. Only after safe, in-scope remediation is exhausted, if the review still cannot be completed as intended or the remaining remediation requires unavailable credentials, user input, new authority, or an external state change, **stop the task under review**. This is a pause for the user's decision, not permission to finish the work. Tell the user what failed, what was attempted, and what is needed, and provide the run-directory evidence when available. Do not implement, revise, finalize, or return the reviewed artifact as though the review occurred. Resume only after a valid review completes or the user explicitly directs you to proceed without it.
 
 ## Usage
