@@ -1,6 +1,6 @@
 ---
 name: claude-second-opinion
-description: "Sends a blocking, time-expensive review packet to Claude Fable 5.1 via CLI at max effort and standard speed by default, with user-requested fast mode and explicit Fable 5, Opus 5, and Opus 4.8 options, inspecting the repo read-only. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-Anthropic agents; Claude/Anthropic agents should prefer gpt-second-opinion for perspective diversity unless the user requests Claude or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
+description: "Sends a blocking, time-expensive review packet to Claude Fable 5.1 via CLI at max effort and standard speed by default, with user-requested fast mode and explicit Fable 5 and Opus 5.5 options, inspecting the repo read-only. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-Anthropic agents; Claude/Anthropic agents should prefer gpt-second-opinion for perspective diversity unless the user requests Claude or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
 ---
 
 # Claude second opinion
@@ -22,9 +22,9 @@ description: "Sends a blocking, time-expensive review packet to Claude Fable 5.1
 ## Reviewer default and per-review fallback
 
 - **Every new review defaults to Fable 5.1 at `max` effort and standard speed**, unless the user explicitly selects another supported model, effort, or fast mode for that review.
-- If Fable cannot be used for a particular review, use **Opus 5 as the fallback for that review only**. Base this decision on a concrete limitation affecting that review, such as model unavailability or an unsupported required capability; do not switch merely because Fable's feedback is unfavorable.
-- Select the fallback through the existing per-invocation arguments: `/claude-second-opinion opus` selects `claude-opus-5` at `max` effort and standard speed. Preserve any effort or fast-mode choice explicitly requested for that review. This is an agent-selected, case-by-case fallback, not an automatic retry on every command failure.
-- **Fallback is not sticky.** Do not change the skill's Fable 5.1 default, persistent Claude settings, or future-review routing. At the next review, start from Fable 5.1 again and assess any limitation afresh; a previous fallback is not permission to keep using Opus 5.
+- If Fable cannot be used for a particular review, use **Opus 5.5 as the fallback for that review only**. Base this decision on a concrete limitation affecting that review, such as model unavailability or an unsupported required capability; do not switch merely because Fable's feedback is unfavorable.
+- Select the fallback through the existing per-invocation arguments: `/claude-second-opinion opus` selects `claude-opus-5-5` at `max` effort and standard speed. Preserve any effort or fast-mode choice explicitly requested for that review. This is an agent-selected, case-by-case fallback, not an automatic retry on every command failure.
+- **Fallback is not sticky.** Do not change the skill's Fable 5.1 default, persistent Claude settings, or future-review routing. At the next review, start from Fable 5.1 again and assess any limitation afresh; a previous fallback is not permission to keep using Opus 5.5.
 - Briefly disclose why the fallback was needed and which model actually performed the review. Keep the same complete review scope, read-only restrictions, and review completion gate. Repair missing inputs or access problems rather than assuming a model switch fixes them. If neither reviewer can complete the review after safe, in-scope remediation, follow the stop-and-report rule.
 
 ## Primary-agent completion gate
@@ -53,7 +53,7 @@ Exactly one `REVIEW STATUS: COMPLETE` marker and no `REVIEW STATUS: INCOMPLETE` 
 If the completion gate fails:
 
 1. Identify a concrete execution, access, packet, or review-coverage failure before rerunning. If that cause can be corrected without user input or new authority, fix it and rerun the second-opinion review. This is required, not optional. Examples include repairing the packet or prompt, correcting a scenario or path, provisioning already-authorized read-only access, adding missing primary material, or enabling a safe local validator inside the enforced read-only sandbox. Do not change the reviewed artifact merely to obtain a more favorable verdict, do not repeat an unchanged failing command, and validate the replacement output against this gate. Attempts required to obtain the first valid review do not count as additional discretionary reviews under the default-frequency rule.
-2. If Claude reviewed only part of the intended scope, treat the whole pass as incomplete. Repair and rerun it; do not fill the gap yourself and continue. If the concrete failure prevents using Fable for this review, apply the per-review Opus 5 fallback above and validate the replacement review against the same completion gate.
+2. If Claude reviewed only part of the intended scope, treat the whole pass as incomplete. Repair and rerun it; do not fill the gap yourself and continue. If the concrete failure prevents using Fable for this review, apply the per-review Opus 5.5 fallback above and validate the replacement review against the same completion gate.
 3. Only after safe, in-scope remediation is exhausted, if the review still cannot be completed as intended or the remaining remediation requires unavailable credentials, user input, new authority, or an external state change, **stop the task under review**. This is a pause for the user's decision, not permission to finish the work. Tell the user what failed, what was attempted, and what is needed, and provide the run-directory evidence when available. Do not implement, revise, finalize, or return the reviewed artifact as though the review occurred. Resume only after a valid review completes or the user explicitly directs you to proceed without it.
 
 ## Usage
@@ -67,11 +67,11 @@ If the completion gate fails:
 - `/claude-second-opinion fable` — uses Fable 5.1 with `max` effort at standard speed
 - `/claude-second-opinion fable xhigh --fast` — uses Fable 5.1 with `xhigh` effort in fast mode
 - `/claude-second-opinion fable-5` — uses Fable 5 with `max` effort at standard speed
-- `/claude-second-opinion opus` — uses Opus 5 with `max` effort at standard speed
-- `/claude-second-opinion opus xhigh --fast` — uses Opus 5 with `xhigh` effort in fast mode
-- `/claude-second-opinion opus-4.8 --fast` — uses Opus 4.8 with `max` effort in fast mode
+- `/claude-second-opinion opus` — uses Opus 5.5 with `max` effort at standard speed
+- `/claude-second-opinion opus xhigh --fast` — uses Opus 5.5 with `xhigh` effort in fast mode
+- `/claude-second-opinion opus-5.5 --fast` — uses Opus 5.5 with `max` effort in fast mode
 
-Supported models are `fable` / `fable-5.1` (Fable 5.1), `fable-5` (Fable 5), `opus` / `opus-5`, and `opus-4.8`. Supported effort values are `xhigh` and `max`. If you pass only an effort value, it applies to the default Fable 5.1 model.
+Supported models are `fable` / `fable-5.1` (Fable 5.1), `fable-5` (Fable 5), `opus` / `opus-5.5` (Opus 5.5). Supported effort values are `xhigh` and `max`. If you pass only an effort value, it applies to the default Fable 5.1 model.
 Fast mode is disabled by default. Pass `--fast` only when the user explicitly requests fast mode for that specific review; do not enable it at agent discretion. The skill passes the choice as a command-line session setting, so it does not change the caller's persistent Claude settings.
 For a requested fast run, the command also skips Claude Code's client-side fast-mode organization preflight. This lets setup-token and gateway users reach the authoritative Anthropic API check instead of receiving a false "disabled by your organization" result. The API still rejects fast requests when the organization actually disables them.
 
@@ -275,12 +275,8 @@ if [ -n "$CONFIG_ARG" ]; then
   case "$MODEL_ARG" in
     "")
       ;;
-    opus|opus-5|claude-opus-5)
-      MODEL="claude-opus-5"
-      EFFORT="${EFFORT_ARG:-max}"
-      ;;
-    opus-4.8|opus-4-8|claude-opus-4.8|claude-opus-4-8)
-      MODEL="claude-opus-4-8"
+    opus|opus-5.5|opus-5-5|claude-opus-5.5|claude-opus-5-5)
+      MODEL="claude-opus-5-5"
       EFFORT="${EFFORT_ARG:-max}"
       ;;
     fable|fable-5.1|fable-5-1|claude-fable-5.1|claude-fable-5-1)
@@ -300,7 +296,7 @@ if [ -n "$CONFIG_ARG" ]; then
       fi
       ;;
     *)
-      printf 'Unsupported claude-second-opinion model or effort: %s\nSupported models: opus, opus-5, opus-4.8, fable, fable-5.1, fable-5. Supported efforts: xhigh, max.\n' "$MODEL_ARG" >&2
+      printf 'Unsupported claude-second-opinion model or effort: %s\nSupported models: opus, opus-5.5, fable, fable-5.1, fable-5. Supported efforts: xhigh, max.\n' "$MODEL_ARG" >&2
       exit 2
       ;;
   esac
@@ -318,10 +314,8 @@ if [ "$MODEL" = "claude-fable-5-1" ] && [ "$EFFORT" != "max" ]; then
   printf 'Warning: Fable 5.1 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
 elif [ "$MODEL" = "claude-fable-5" ] && [ "$EFFORT" != "max" ]; then
   printf 'Warning: Fable 5 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
-elif [ "$MODEL" = "claude-opus-5" ] && [ "$EFFORT" != "max" ]; then
-  printf 'Warning: Opus 5 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
-elif [ "$MODEL" = "claude-opus-4-8" ] && [ "$EFFORT" != "max" ]; then
-  printf 'Warning: Opus 4.8 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
+elif [ "$MODEL" = "claude-opus-5-5" ] && [ "$EFFORT" != "max" ]; then
+  printf 'Warning: Opus 5.5 defaults to max effort; using explicitly requested effort: %s\n' "$EFFORT" >&2
 fi
 
 FAST_MODE_SETTINGS="$(printf '{"fastMode": %s}' "$FAST_MODE")"
