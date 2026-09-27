@@ -1,4 +1,0 @@
-interface:
-  display_name: "Claude Worker"
-  short_description: "Orchestrate extra Claude workers with Codex parity"
-  default_prompt: "Use $claude-worker to add owned Claude lanes with a fresh role-aware orchestration snapshot, sampled machine admission, native-first priority, parent authority parity, and inspected terminal results."
