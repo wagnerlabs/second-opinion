@@ -1,6 +1,6 @@
 ---
 name: gpt-second-opinion
-description: "Sends a blocking, time-expensive review packet to GPT-6 Astra via Codex CLI at maximum reasoning effort and OpenAI fast mode by default, inspecting the repo in a read-only sandbox. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-OpenAI agents; GPT/OpenAI agents should prefer claude-second-opinion for perspective diversity unless the user requests GPT or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
+description: "Sends a blocking, time-expensive review packet to GPT-6 Astra via Codex CLI at maximum reasoning effort and standard speed by default (OpenAI fast mode is opt-in), inspecting the repo in a read-only sandbox. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-OpenAI agents; GPT/OpenAI agents should prefer claude-second-opinion for perspective diversity unless the user requests GPT or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
 ---
 
 # GPT second opinion
@@ -32,13 +32,14 @@ This gate applies before packet construction or reviewer invocation.
 ## Usage
 
 ```text
-/gpt-second-opinion [--no-fast]
+/gpt-second-opinion [--fast | --no-fast]
 ```
 
-- `/gpt-second-opinion` — uses GPT-6 Astra with `max` effort in OpenAI fast mode (default)
-- `/gpt-second-opinion --no-fast` — uses GPT-6 Astra with `max` effort at standard speed
+- `/gpt-second-opinion` — uses GPT-6 Astra with `max` effort at standard speed (default)
+- `/gpt-second-opinion --fast` — uses GPT-6 Astra with `max` effort in OpenAI fast mode
+- `/gpt-second-opinion --no-fast` — explicitly selects standard speed (retained for compatibility)
 
-Fast mode is enabled by default. Pass `--no-fast` to disable it for a specific review. The skill passes the choice as command-line configuration for that invocation, so it does not change the caller's persistent Codex settings.
+Fast mode is disabled by default. Pass `--fast` to enable it for a specific review. The skill passes the choice as command-line configuration for that invocation, so it does not change the caller's persistent Codex settings.
 
 ## Review completion gate
 
@@ -218,17 +219,24 @@ SCENARIO="independent-rca"  # set to: independent-rca, plan-review, post-impleme
 PACKET_PATH="/var/folders/.../gpt-second-opinion.AbC123/packet.md"
 OUT_PATH="/var/folders/.../gpt-second-opinion.AbC123/output.txt"
 
-FAST_MODE="true"
-SERVICE_TIER="fast"
+FAST_MODE="false"
+SERVICE_TIER="default"
 CONFIG_ARG="{{args}}"
 if [ -n "$CONFIG_ARG" ]; then
-  set -- $CONFIG_ARG
-  if [ "$#" -ne 1 ] || [ "$1" != "--no-fast" ]; then
-    printf 'Unsupported gpt-second-opinion arguments: %s\nSupported option: --no-fast.\n' "$CONFIG_ARG" >&2
-    exit 2
-  fi
-  FAST_MODE="false"
-  SERVICE_TIER="default"
+  case "$CONFIG_ARG" in
+    --fast)
+      FAST_MODE="true"
+      SERVICE_TIER="fast"
+      ;;
+    --no-fast)
+      FAST_MODE="false"
+      SERVICE_TIER="default"
+      ;;
+    *)
+      printf 'Unsupported gpt-second-opinion arguments: %s\nSupported options: --fast or --no-fast.\n' "$CONFIG_ARG" >&2
+      exit 2
+      ;;
+  esac
 fi
 
 if [ "$SCENARIO" = "independent-rca" ]; then
