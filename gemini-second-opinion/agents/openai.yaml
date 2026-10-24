@@ -1,0 +1,5 @@
+interface:
+  display_name: "Gemini Second Opinion"
+  short_description: "Independent Gemini review with filesystem protection"
+policy:
+  allow_implicit_invocation: true

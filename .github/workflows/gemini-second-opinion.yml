@@ -1,0 +1,37 @@
+name: Gemini second-opinion runner
+
+on:
+  push:
+    paths:
+      - 'gemini-second-opinion/**'
+      - '.github/workflows/gemini-second-opinion.yml'
+  pull_request:
+    paths:
+      - 'gemini-second-opinion/**'
+      - '.github/workflows/gemini-second-opinion.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-bubblewrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Permit user namespaces on the disposable CI host
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Unit and actual sandbox integration tests with stub agy
+        env:
+          REQUIRE_SANDBOX_TESTS: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s gemini-second-opinion/tests -v
