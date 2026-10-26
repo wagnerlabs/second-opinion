@@ -264,6 +264,35 @@ class SandboxFixture(Fixture):
 
 
 class ActualSandboxTests(SandboxFixture):
+    @unittest.skipUnless(sys.platform == "linux", "Linux runtime mount view")
+    def test_agentapi_rewrites_are_disposable_and_other_binaries_stay_read_only(self):
+        runtime_bin = self.state / "bin"
+        runtime_bin.mkdir()
+        helper = runtime_bin / "agentapi"
+        helper.write_text("installed helper")
+        binary = runtime_bin / "other-tool"
+        binary.write_text("installed binary")
+        run = self.evidence / "helper-view"
+        run.mkdir()
+        sandbox = runner.Sandbox(run, self.home)
+        command = r'''
+import pathlib, sys
+helper, binary = map(pathlib.Path, sys.argv[1:])
+helper.write_text("generated helper")
+helper.chmod(0o755)
+assert binary.read_text() == "installed binary"
+for action in (lambda: binary.write_text("bad"), lambda: binary.unlink()):
+    try: action()
+    except OSError: pass
+    else: raise SystemExit("installed binary mutation succeeded")
+'''
+        for _ in range(2):
+            result = subprocess.run(sandbox.command([sys.executable, "-c", command, helper, binary]), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(helper.read_text(), "installed helper")
+        self.assertEqual(binary.read_text(), "installed binary")
+        self.assertEqual((sandbox.scratch / "agy-bin/agentapi").read_text(), "generated helper")
+
     def test_actual_read_terminal_scratch_and_original_protection(self):
         (self.sandbox.scratch / "linked root").symlink_to(self.repo, target_is_directory=True)
         commands = r'''

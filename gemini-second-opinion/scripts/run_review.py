@@ -212,6 +212,7 @@ class Sandbox:
         state = home / ".gemini/antigravity-cli"
         self.writable = [self.scratch]
         self.files = []
+        self.runtime_views = []
         if state.is_symlink() or state.resolve() != state.absolute():
             raise ReviewError(f"agy runtime root must not use symlinks: {state}")
         # Existing runtime data only. Do not create or initialize account state.
@@ -256,6 +257,24 @@ class Sandbox:
                            "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]
             for path in (*self.writable, *self.files):
                 self.prefix += ["--bind", str(path), str(path)]
+            # agy regenerates bin/agentapi for every terminal call. Give it a
+            # disposable view, preserving every other installed entry read-only.
+            runtime_bin = state / "bin"
+            if runtime_bin.exists() or runtime_bin.is_symlink():
+                if runtime_bin.is_symlink() or not runtime_bin.is_dir():
+                    raise ReviewError(f"agy runtime bin must be a real directory: {runtime_bin}")
+                view = self.scratch / "agy-bin"
+                view.mkdir()
+                self.prefix += ["--bind", str(view), str(runtime_bin)]
+                for entry in sorted(runtime_bin.iterdir()):
+                    if entry.name == "agentapi":
+                        continue
+                    if not entry.is_file() and not entry.is_dir():
+                        raise ReviewError(f"Unsupported agy runtime bin entry: {entry}")
+                    target = view / entry.name
+                    target.mkdir() if entry.is_dir() else target.touch()
+                    self.prefix += ["--ro-bind", str(entry), str(runtime_bin / entry.name)]
+                self.runtime_views.append(runtime_bin)
             # Network remains shared; do not add --unshare-net or --unshare-all.
             self.prefix += ["--"]
         else:
@@ -738,17 +757,18 @@ def execute(args, *, runtime_home=None):
         sandbox = prepare(Sandbox, run, home)
         metadata["writable_directories"] = list(map(str, sandbox.writable))
         metadata["writable_files"] = list(map(str, sandbox.files))
-        for writable in (*sandbox.writable[1:], *sandbox.files):
+        metadata["disposable_runtime_views"] = list(map(str, sandbox.runtime_views))
+        for writable in (*sandbox.writable[1:], *sandbox.files, *sandbox.runtime_views):
             if within(writable, repo) or within(repo, writable) or within(run, writable):
                 raise ReviewError(f"Repository/evidence overlaps writable agy runtime data: {writable}")
         for item in materials:
-            if any(within(Path(item["path"]), directory) for directory in sandbox.writable) or Path(item["path"]) in sandbox.files:
+            if any(within(Path(item["path"]), directory) for directory in (*sandbox.writable, *sandbox.runtime_views)) or Path(item["path"]) in sandbox.files:
                 raise ReviewError(f"Critical material is in writable runtime data: {item['path']}. Supply a protected snapshot.")
         executable = shutil.which(args.agy)
         if not executable:
             raise ReviewError(f"agy executable not found: {args.agy}")
         executable = str(Path(executable).resolve())
-        if any(within(Path(executable), directory) for directory in sandbox.writable):
+        if any(within(Path(executable), directory) for directory in (*sandbox.writable, *sandbox.runtime_views)):
             raise ReviewError("agy executable must not be in writable review/runtime data.")
         metadata["executable"] = {"path": executable, "sha256": prepare(digest, Path(executable))}
         env = dict(os.environ, TMPDIR=str(sandbox.scratch), TMP=str(sandbox.scratch), TEMP=str(sandbox.scratch),
