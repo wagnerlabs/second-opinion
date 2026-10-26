@@ -224,17 +224,30 @@ Run this as a shell command. Set `SCENARIO` to match the packet, and substitute 
 
 The command below preserves the established default permission behavior. If the verification preflight identified a required safe read-only command or MCP tool that it does not expose, narrowly adjust the relevant tool allowlist, MCP configuration, or sandbox setting for that run. Preserve repository read-only behavior and do not expose broad credentials.
 
-By default, the command auto-selects Claude execution mode:
+Use normal Claude Code execution by default, including inside Hermes:
 
-- `CLAUDE_SECOND_OPINION_MODE=auto` (default) uses `--bare` inside Hermes worker/profile contexts and normal `claude -p` elsewhere.
-- `CLAUDE_SECOND_OPINION_MODE=bare` forces Hermes-worker style execution. This is recommended for Hermes workers because `--bare` skips hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, OAuth/session discovery, and CLAUDE.md auto-discovery. In the AGE-62 bridge setup it uses the API-key/apiKeyHelper path supplied to the real Claude child process while the surrounding shell stays credential-scrubbed.
-- `CLAUDE_SECOND_OPINION_MODE=normal` forces normal Claude Code execution for personal terminals or other runtimes that should use the caller's own Claude auth and normal Claude Code behavior.
+- `CLAUDE_SECOND_OPINION_MODE=auto` (default) and `normal` both run normal `claude -p`, preserving access to the caller's subscription login and macOS Keychain.
+- `CLAUDE_SECOND_OPINION_MODE=bare` is for an intentionally API-backed review. Use it only when API billing is authorized for the task. It disables OAuth and Keychain authentication and requires an API key or `apiKeyHelper`; running inside Hermes alone is not a reason to select it.
+
+Before invoking the reviewer, check `command -v claude` and `claude auth status` in the actual review terminal. For a subscription-backed review, confirm `authMethod: claude.ai` and the intended account. Use the same executable and environment for the check and review. An absent `~/.claude/.credentials.json` does not mean the caller is logged out: macOS normally stores the login in Keychain.
+
+If Hermes resolves `claude` to its `claude-cli-auth-bridge` wrapper, that wrapper may inject `ANTHROPIC_API_KEY` from Hermes env files even when a Keychain subscription login exists. For an installation intended to use that subscription, disable the bridge in the owning profile's `config.yaml`:
+
+```yaml
+claude_cli_auth_bridge:
+  enabled: false
+```
+
+Start a fresh Hermes terminal session and repeat the auth check. An existing shell snapshot or a hardcoded wrapper path may still select the old wrapper; use the official installed Claude executable directly for both the auth check and `CLAUDE_BIN` below when necessary. Keep the caller's account/profile scope; do not copy credentials or change `HOME`. Unsetting a key in the outer shell is insufficient if the wrapper injects it again. Do not remove shared API credentials needed by other tools.
+
+When Claude reports a credit-balance error, verify which authentication source was selected before requesting more credit or a new login. API credit exhaustion does not establish that the subscription allowance is exhausted. Switching models cannot repair an authentication or billing-route mismatch.
 
 ```sh
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 SCENARIO="independent-rca"  # set to: independent-rca, plan-review, post-implementation-review, document-review, or analysis-review
 PACKET_PATH="/var/folders/.../claude-second-opinion.AbC123/packet.md"
 OUT_PATH="/var/folders/.../claude-second-opinion.AbC123/output.txt"
+CLAUDE_BIN="claude"  # Use the executable verified by the auth preflight above.
 
 MODEL="claude-fable-5-1"
 EFFORT="max"
@@ -325,15 +338,11 @@ else
   unset CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK
 fi
 
-# Claude execution mode. Keep normal Claude Code behavior available for
-# personal terminals while defaulting Hermes workers/profiles to --bare.
+# Keep subscription and Keychain authentication available in every runtime.
+# Bare mode is an explicit choice for an authorized API-backed review.
 CLAUDE_SECOND_OPINION_MODE="${CLAUDE_SECOND_OPINION_MODE:-auto}"
 if [ "$CLAUDE_SECOND_OPINION_MODE" = "auto" ]; then
-  if [ -n "${HERMES_HOME:-}" ] || [ -n "${HERMES_PROFILE:-}" ] || [ -n "${HERMES_TASK_ID:-}" ] || [ -n "${HERMES_KANBAN_TASK:-}" ]; then
-    CLAUDE_SECOND_OPINION_MODE="bare"
-  else
-    CLAUDE_SECOND_OPINION_MODE="normal"
-  fi
+  CLAUDE_SECOND_OPINION_MODE="normal"
 fi
 
 case "$CLAUDE_SECOND_OPINION_MODE" in
@@ -360,7 +369,7 @@ fi
 COMPLETION_REQUIREMENT='Before returning, verify that you actually read and evaluated the complete intended review target and every critical/load-bearing related material. Independently inspect the primary material needed to form your opinion; do not accept conclusions supplied by the invoking agent as established background. Do not expand an ordinary review into reproducing every test or checking incidental facts outside the requested scope unless your verdict materially depends on that check. User-stated premises remain inputs unless the packet expressly asks you to verify them. Use read-only tools for safe checks essential to the requested review. REVIEW STATUS reports operational success: successful execution, access to every critical/load-bearing related material, and coverage of the requested scope; it does not grade the artifact. Return REVIEW STATUS: COMPLETE even when you reject the artifact, identify blocking defects or omissions, recommend changes, disagree with the invoking agent, or raise questions, provided you inspected every critical/load-bearing related material and addressed the full requested scope. Return REVIEW STATUS: INCOMPLETE when an execution, authentication, permission, tool, path, missing-input, or other access/coverage failure prevented access to any critical/load-bearing related material or prevented any other required part of the review; identify the precise failure so the caller can repair it and rerun. If you state that you could not access X and X is critical/load-bearing, you must mark the review INCOMPLETE even if you provide useful feedback on the rest. An omission within the artifact is review feedback only when that absence is itself a defect in the artifact, not when a separate or referenced critical material was expected but inaccessible. Within the first five non-empty lines, write exactly one REVIEW STATUS: COMPLETE line and no REVIEW STATUS: INCOMPLETE line for an operationally successful review; otherwise write exactly one REVIEW STATUS: INCOMPLETE line and no REVIEW STATUS: COMPLETE line. Then identify the concrete repository target, critical/load-bearing related materials, and material checks you inspected and disclose anything you could not access or evaluate. Never label a partial review complete.'
 PROMPT="$PROMPT $COMPLETION_REQUIREMENT"
 
-cd "$REPO_ROOT" && claude ${CLAUDE_BARE_FLAG:+$CLAUDE_BARE_FLAG} -p \
+cd "$REPO_ROOT" && "$CLAUDE_BIN" ${CLAUDE_BARE_FLAG:+$CLAUDE_BARE_FLAG} -p \
   --settings "$FAST_MODE_SETTINGS" \
   --model "$MODEL" \
   --effort "$EFFORT" \
