@@ -34,7 +34,7 @@ Explicit Gemini slugs and `low`, `medium`, `high`, `xhigh`, or `max` are accepte
 
 ## Prepare the packet and materials
 
-Use a unique working directory under `/Users/Shared/Codex/gemini-second-opinion/` on macOS. On Linux, use a unique temporary directory. Keep both outside the repository. Save images in that working directory. The runner makes a separate unique evidence directory, snapshots the packet and images, and leaves them protected.
+Use a unique working directory under `${TMPDIR:-/tmp}` on macOS and Linux, outside the repository. Save the packet, manifest, and images there. The runner makes a separate `gemini-second-opinion-*` evidence directory under the same temporary root by default, snapshots the packet and images, and leaves them protected. When a different working location is explicitly required, prepare the files there and pass `--evidence-root PATH` to place the runner's evidence there too.
 
 Write the packet in one operation with a quoted heredoc or Python reading stdin. Read it back in full before invoking the runner. Do not patch a stale packet; rewrite it if validation finds errors. Keep it minimal: point to files, avoid large code/diff excerpts and repository summaries, and distinguish agent claims from user premises and primary evidence.
 

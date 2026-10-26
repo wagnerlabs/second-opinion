@@ -19,17 +19,9 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
-def temp_directory():
-    if sys.platform == "darwin":
-        base = Path("/Users/Shared/Codex/gemini-second-opinion")
-        base.mkdir(parents=True, exist_ok=True)
-        return tempfile.TemporaryDirectory(prefix="test-", dir=base)
-    return tempfile.TemporaryDirectory(prefix="gemini-second-opinion-test-")
-
-
 class Fixture(unittest.TestCase):
     def setUp(self):
-        self.temp = temp_directory()
+        self.temp = tempfile.TemporaryDirectory(prefix="gemini-second-opinion-test-", dir=os.environ.get("TMPDIR") or "/tmp")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo with spaces"
@@ -322,7 +314,7 @@ else: raise SystemExit("hardlink bypass")
 class StubIntegrationTests(SandboxFixture):
     # Each end-to-end test uses the real outer sandbox, while agy is a protocol
     # fixture with no authentication.
-    def invoke(self, case="success", *, effort="high", images=False, copy=False):
+    def invoke(self, case="success", *, effort="high", images=False, copy=False, evidence_root=None):
         fixture = self.root / "stub-config.json"
         fixture.write_text(json.dumps({"case": case, "settings": str(self.settings)}))
         executable = self.root / "agy stub"
@@ -336,16 +328,19 @@ class StubIntegrationTests(SandboxFixture):
             self.materials.append({"id": "picture", "path": str(picture), "kind": "image"})
             self.manifest.write_text(json.dumps({"critical_materials": self.materials}))
         args = argparse.Namespace(repo=str(self.repo), packet=str(self.packet), manifest=str(self.manifest),
-                                  evidence_root=str(self.evidence), model="gemini-4-argon", effort=effort,
+                                  evidence_root=evidence_root, model="gemini-4-argon", effort=effort,
                                   timeout_seconds=1.0 if case == "timeout" else 20, copy_for_checks=copy, agy=str(executable))
-        before = set(self.evidence.iterdir())
-        with mock.patch.dict(os.environ, {"AGY_REVIEW_TEST_FIXTURE": str(fixture)}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        run_root = Path(evidence_root) if evidence_root is not None else self.evidence
+        run_root.mkdir(parents=True, exist_ok=True)
+        before = set(run_root.iterdir())
+        with mock.patch.dict(os.environ, {"AGY_REVIEW_TEST_FIXTURE": str(fixture), "TMPDIR": str(self.evidence)}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = runner.execute(args, runtime_home=self.home)
-        run = next(iter(set(self.evidence.iterdir()) - before))
+        run = next(iter(set(run_root.iterdir()) - before))
+        self.assertTrue(run.name.startswith("gemini-second-opinion-"))
         return code, json.loads((run / "result.json").read_text()), run
 
     def test_full_success_images_and_copy(self):
-        code, meta, run = self.invoke(images=True, copy=True)
+        code, meta, run = self.invoke(images=True, copy=True, evidence_root=str(self.root / "custom evidence"))
         self.assertEqual(code, 0, meta)
         self.assertEqual(meta["selected_model"]["id"], "gemini-4-argon-high")
         self.assertEqual(meta["status"], "awaiting-primary-agent-coverage-assessment")

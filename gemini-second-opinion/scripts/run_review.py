@@ -713,12 +713,11 @@ def execute(args, *, runtime_home=None):
     if not repo.is_dir():
         raise ReviewError("--repo must identify a repository root directory.")
     packet, manifest = Path(args.packet).resolve(strict=True), Path(args.manifest).resolve(strict=True)
-    base = Path(args.evidence_root).expanduser().resolve() if args.evidence_root else (
-        Path("/Users/Shared/Codex/gemini-second-opinion") if sys.platform == "darwin" else Path(tempfile.gettempdir()))
+    base = Path(args.evidence_root or os.environ.get("TMPDIR") or "/tmp").expanduser().resolve()
     if within(base, repo):
         raise ReviewError("Evidence/scratch must be outside the original repository.")
     base.mkdir(parents=True, exist_ok=True)
-    run = Path(tempfile.mkdtemp(prefix="review-", dir=base)).resolve()
+    run = Path(tempfile.mkdtemp(prefix="gemini-second-opinion-", dir=base)).resolve()
     print(f"Review evidence: {run}", flush=True)
     metadata = {"status": "incomplete", "requested_model": args.model, "effort": args.effort,
                 "timeout_seconds": args.timeout_seconds, "repo": str(repo), "commands": "*.command.json",
@@ -847,7 +846,7 @@ def parser():
     result.add_argument("--model", default="gemini-4-argon")
     result.add_argument("--effort", default="high", choices=EFFORTS)
     result.add_argument("--timeout-seconds", type=float, default=1800)
-    result.add_argument("--evidence-root", help="Parent of unique run directories; must be outside the repository")
+    result.add_argument("--evidence-root", help="Parent of unique run directories (default: TMPDIR or /tmp); must be outside the repository")
     result.add_argument("--copy-for-checks", action="store_true", help="Prepare and verify a faithful disposable file copy for checks requiring writes")
     result.add_argument("--agy", default="agy", help="CLI executable (also permits isolated integration stubs)")
     return result
