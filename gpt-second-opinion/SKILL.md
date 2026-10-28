@@ -19,6 +19,8 @@ description: "Sends a blocking, time-expensive review packet to GPT-6 Astra via 
 - Treat the review as a second opinion, not an approval authority. A critical verdict, requested changes, unresolved recommendations, or your decision to reject some or all feedback does not keep the gate open.
 - Default frequency: at most one completed review per non-trivial task/artifact. Run again only to replace a pass that failed the execution/access/coverage gate, when the user explicitly requests another review, or for a materially different downstream artifact such as a completed implementation after a plan review. Never rerun a revised plan, implementation, document, or analysis merely to seek GPT's agreement, approval, or confirmation that feedback was addressed.
 
+**Post-delivery mode.** An operator-configured integration may run this review automatically after your answer has already been delivered. Nothing is blocked, and the conversation continues. When the result arrives, assess it under the same completion and feedback rules. Send a short plain-English correction in the same conversation only for a material problem: a wrong fact or number, flawed reasoning, or a missing caveat that changes the conclusion, confidence, or recommendation. Otherwise stay silent. Failed or incomplete automatic reviews stay internal. This mode never applies to ordinary invocation, and it does not authorize you to start background reviews on your own initiative.
+
 ## Primary-agent completion gate
 
 This gate applies before packet construction or reviewer invocation.
