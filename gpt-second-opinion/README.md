@@ -1,6 +1,6 @@
 # GPT second opinion
 
-Sends a time-expensive, blocking review packet to GPT-6 Astra at maximum reasoning effort via the Codex CLI, pointed at the full repo in read-only sandbox mode. Fast mode is off by default.
+Sends a time-expensive, blocking review packet to GPT-6.2 Astra at maximum reasoning effort via the Codex CLI, pointed at the full repo in read-only sandbox mode. Fast mode is off by default.
 
 ## Usage
 

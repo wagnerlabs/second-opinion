@@ -1,6 +1,6 @@
 ---
 name: gpt-second-opinion
-description: "Sends a blocking, time-expensive review packet to GPT-6 Astra via Codex CLI at maximum reasoning effort and standard speed by default (OpenAI fast mode is opt-in), inspecting the repo in a read-only sandbox. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-OpenAI agents; GPT/OpenAI agents should prefer claude-second-opinion for perspective diversity unless the user requests GPT or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
+description: "Sends a blocking, time-expensive review packet to GPT-6.2 Astra via Codex CLI at maximum reasoning effort and standard speed by default (OpenAI fast mode is opt-in), inspecting the repo in a read-only sandbox. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-OpenAI agents; GPT/OpenAI agents should prefer claude-second-opinion for perspective diversity unless the user requests GPT or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
 ---
 
 # GPT second opinion
@@ -37,8 +37,8 @@ This gate applies before packet construction or reviewer invocation.
 /gpt-second-opinion [--fast | --no-fast]
 ```
 
-- `/gpt-second-opinion` — uses GPT-6 Astra with `max` effort at standard speed (default)
-- `/gpt-second-opinion --fast` — uses GPT-6 Astra with `max` effort in OpenAI fast mode
+- `/gpt-second-opinion` — uses GPT-6.2 Astra with `max` effort at standard speed (default)
+- `/gpt-second-opinion --fast` — uses GPT-6.2 Astra with `max` effort in OpenAI fast mode
 - `/gpt-second-opinion --no-fast` — explicitly selects standard speed (retained for compatibility)
 
 Fast mode is disabled by default. Pass `--fast` to enable it for a specific review. The skill passes the choice as command-line configuration for that invocation, so it does not change the caller's persistent Codex settings.
@@ -257,7 +257,7 @@ COMPLETION_REQUIREMENT='Before returning, verify that you actually read and eval
 PROMPT="$PROMPT $COMPLETION_REQUIREMENT"
 
 cd "$REVIEW_ROOT" && codex exec \
-  -m gpt-6-astra \
+  -m gpt-6.2-astra \
   -c model_reasoning_effort=max \
   -c features.fast_mode="$FAST_MODE" \
   -c service_tier="$SERVICE_TIER" \
