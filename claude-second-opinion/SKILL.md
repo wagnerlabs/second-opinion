@@ -28,7 +28,7 @@ description: "Sends a blocking, time-expensive review packet to Claude Fable 5.2
 - Select the fallback through the existing per-invocation arguments: `/claude-second-opinion opus` selects `claude-opus-5-5` at `max` effort and standard speed. Preserve any effort or fast-mode choice explicitly requested for that review. This is an agent-selected, case-by-case fallback, not an automatic retry on every command failure.
 - **Fallback is not sticky.** Do not change the skill's Fable 5.2 default, persistent Claude settings, or future-review routing. At the next review, start from Fable 5.2 again and assess any limitation afresh; a previous fallback is not permission to keep using Opus 5.5.
 - Briefly disclose why the fallback was needed and which model actually performed the review. Keep the same complete review scope, read-only restrictions, and review completion gate. Repair missing inputs or access problems rather than assuming a model switch fixes them. If neither reviewer can complete the review after safe, in-scope remediation, follow the stop-and-report rule.
-- **A login the user names.** The user may choose the Claude login that runs the review by pointing at the settings folder of an existing, signed-in Claude Code login: `--config-dir=<folder>`, or the `CLAUDE_SECOND_OPINION_CONFIG_DIR` environment variable for a path with spaces. The command then runs the reviewer on that login only. It sets `CLAUDE_CONFIG_DIR` to the folder, ignores any API key or token in the environment, checks `claude auth status` for that login, and stops if it isn't signed in. Judge whether Fable can be used on that login, not on another one: the Opus 5.5 fallback applies only when Fable can't run there. When you report a fallback or a used-up allowance, name the login you checked. If the user names an account without saying where its login is saved, find it in their instructions or ask; never guess, and never run the review on a different login.
+- **A login the user names.** The user may choose the Claude login that runs the review by pointing at the settings folder of an existing, signed-in Claude Code login: `--config-dir=<folder>`, or the `CLAUDE_SECOND_OPINION_CONFIG_DIR` environment variable for a path with spaces. The command then runs the reviewer on that login only. It sets `CLAUDE_CONFIG_DIR` to the folder, ignores API keys, tokens and provider switches in the environment, and stops unless `claude auth status` shows that folder's own signed-in claude.ai login. Judge whether Fable can be used on that login, not on another one: the Opus 5.5 fallback applies only when Fable can't run there, and runs with the same `--config-dir`. When you report a fallback or a used-up allowance, name the login you checked. If the user names an account without saying where its login is saved, find it in their instructions or ask; never guess, and never run the review on a different login.
 
 ## Primary-agent completion gate
 
@@ -274,6 +274,10 @@ if [ -n "$CONFIG_ARG" ]; then
         fi
         LOGIN_DIR="${ARG#--config-dir=}"
         LOGIN_DIR_OPTION_SEEN="true"
+        if [ -z "$LOGIN_DIR" ]; then
+          printf 'Empty --config-dir. Name the settings folder of an existing, signed-in Claude Code login.\n' >&2
+          exit 2
+        fi
         ;;
       --fast)
         if [ "$FAST_MODE_OPTION_SEEN" = "true" ]; then
@@ -383,14 +387,25 @@ if [ -n "$LOGIN_DIR" ]; then
     printf 'No Claude settings folder at %s. Name the folder of an existing, signed-in Claude Code login.\n' "$LOGIN_DIR" >&2
     exit 2
   fi
-  # Credentials in the environment would override the folder's login.
-  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+  # Resolve it once, before any cd.
+  LOGIN_DIR="$(cd "$LOGIN_DIR" && pwd)"
+  # Credentials and provider switches in the environment would override the folder's login.
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_OAUTH_TOKEN \
+    CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR \
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
   export CLAUDE_CONFIG_DIR="$LOGIN_DIR"
-  if ! LOGIN_STATUS="$("$CLAUDE_BIN" auth status 2>&1)"; then
-    printf 'The Claude login in %s is not signed in, so the review did not run:\n%s\n' "$LOGIN_DIR" "$LOGIN_STATUS" >&2
+  LOGIN_STATUS="$("$CLAUDE_BIN" auth status 2>&1)"
+  # Run only if the status says this folder's own claude.ai login is the one in use.
+  if ! printf '%s' "$LOGIN_STATUS" | python3 -c '
+import json, os, sys
+s = json.load(sys.stdin)
+same = os.path.realpath(s.get("configDirectory") or "") == os.path.realpath(sys.argv[1])
+sys.exit(0 if s.get("loggedIn") is True and s.get("authMethod") == "claude.ai" and same else 1)
+' "$LOGIN_DIR" 2>/dev/null; then
+    printf 'The login in %s is not the signed-in claude.ai login in use, so the review did not run:\n%s\n' "$LOGIN_DIR" "$LOGIN_STATUS" >&2
     exit 4
   fi
-  printf 'Reviewer login (%s):\n%s\n' "$LOGIN_DIR" "$LOGIN_STATUS" >&2
+  printf 'Reviewer login checked: %s (claude.ai)\n' "$LOGIN_DIR" >&2
 fi
 
 if [ "$SCENARIO" = "independent-rca" ]; then
