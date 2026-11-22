@@ -1,6 +1,6 @@
 ---
 name: claude-second-opinion
-description: "Sends a blocking, time-expensive review packet to Claude Fable 5.2 via CLI at max effort and standard speed by default, with user-requested fast mode and explicit Fable 5 and Opus 5.5 options, inspecting the repo read-only. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-Anthropic agents; Claude/Anthropic agents should prefer gpt-second-opinion for perspective diversity unless the user requests Claude or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
+description: "Sends a blocking, time-expensive review packet to Claude Fable 5.2 via CLI at max effort and standard speed by default, with user-requested fast mode, explicit Fable 5 and Opus 5.5 options and an optional saved Claude login to run on, inspecting the repo read-only. Use for non-trivial RCA, plans, implementations, documents, or analyses when the user asks or an agent judges a second opinion worthwhile, generally once per artifact. For newly requested work, invoke only after the primary agent has completed its best attempt; never use the reviewer to develop or finish it. Primarily for non-Anthropic agents; Claude/Anthropic agents should prefer gpt-second-opinion for perspective diversity unless the user requests Claude or task constraints favor it. Once invoked, block until the review has accessed all critical material and been considered; repair and rerun execution, access, or coverage failures, and stop after unremediable failure unless the user waives. Feedback is advisory; disagreement never requires approval or rerun."
 ---
 
 # Claude second opinion
@@ -28,6 +28,7 @@ description: "Sends a blocking, time-expensive review packet to Claude Fable 5.2
 - Select the fallback through the existing per-invocation arguments: `/claude-second-opinion opus` selects `claude-opus-5-5` at `max` effort and standard speed. Preserve any effort or fast-mode choice explicitly requested for that review. This is an agent-selected, case-by-case fallback, not an automatic retry on every command failure.
 - **Fallback is not sticky.** Do not change the skill's Fable 5.2 default, persistent Claude settings, or future-review routing. At the next review, start from Fable 5.2 again and assess any limitation afresh; a previous fallback is not permission to keep using Opus 5.5.
 - Briefly disclose why the fallback was needed and which model actually performed the review. Keep the same complete review scope, read-only restrictions, and review completion gate. Repair missing inputs or access problems rather than assuming a model switch fixes them. If neither reviewer can complete the review after safe, in-scope remediation, follow the stop-and-report rule.
+- **A login the user names.** The user may choose the Claude login that runs the review by pointing at the settings folder of an existing, signed-in Claude Code login: `--config-dir=<folder>`, or the `CLAUDE_SECOND_OPINION_CONFIG_DIR` environment variable for a path with spaces. The command then runs the reviewer on that login only. It sets `CLAUDE_CONFIG_DIR` to the folder, ignores any API key or token in the environment, checks `claude auth status` for that login, and stops if it isn't signed in. Judge whether Fable can be used on that login, not on another one: the Opus 5.5 fallback applies only when Fable can't run there. When you report a fallback or a used-up allowance, name the login you checked. If the user names an account without saying where its login is saved, find it in their instructions or ask; never guess, and never run the review on a different login.
 
 ## Primary-agent completion gate
 
@@ -72,6 +73,7 @@ If the completion gate fails:
 - `/claude-second-opinion opus` — uses Opus 5.5 with `max` effort at standard speed
 - `/claude-second-opinion opus xhigh --fast` — uses Opus 5.5 with `xhigh` effort in fast mode
 - `/claude-second-opinion opus-5.5 --fast` — uses Opus 5.5 with `max` effort in fast mode
+- `/claude-second-opinion --config-dir=~/.claude-work` — uses the default reviewer on the Claude login saved in `~/.claude-work`. It combines with any form above, for example `/claude-second-opinion opus xhigh --config-dir=~/.claude-work`.
 
 Supported models are `fable` / `fable-5.2` (Fable 5.2), `fable-5` (Fable 5), `opus` / `opus-5.5` (Opus 5.5). Supported effort values are `xhigh` and `max`. If you pass only an effort value, it applies to the default Fable 5.2 model.
 Fast mode is disabled by default. Pass `--fast` only when the user explicitly requests fast mode for that specific review; do not enable it at agent discretion. The skill passes the choice as a command-line session setting, so it does not change the caller's persistent Claude settings.
@@ -231,7 +233,7 @@ Use normal Claude Code execution by default, including inside Hermes:
 - `CLAUDE_SECOND_OPINION_MODE=auto` (default) and `normal` both run normal `claude -p`, preserving access to the caller's subscription login and macOS Keychain.
 - `CLAUDE_SECOND_OPINION_MODE=bare` is for an intentionally API-backed review. Use it only when API billing is authorized for the task. It disables OAuth and Keychain authentication and requires an API key or `apiKeyHelper`; running inside Hermes alone is not a reason to select it.
 
-Before invoking the reviewer, check `command -v claude` and `claude auth status` in the actual review terminal. For a subscription-backed review, confirm `authMethod: claude.ai` and the intended account. Use the same executable and environment for the check and review. An absent `~/.claude/.credentials.json` does not mean the caller is logged out: macOS normally stores the login in Keychain.
+Before invoking the reviewer, check `command -v claude` and `claude auth status` in the actual review terminal. For a subscription-backed review, confirm `authMethod: claude.ai` and the intended account. Use the same executable and environment for the check and review. An absent `~/.claude/.credentials.json` does not mean the caller is logged out: macOS normally stores the login in Keychain. With `--config-dir`, the command runs this check itself on the named login and stops if that login isn't signed in.
 
 If Hermes resolves `claude` to its `claude-cli-auth-bridge` wrapper, that wrapper may inject `ANTHROPIC_API_KEY` from Hermes env files even when a Keychain subscription login exists. For an installation intended to use that subscription, disable the bridge in the owning profile's `config.yaml`:
 
@@ -257,11 +259,22 @@ FAST_MODE="false"
 FAST_MODE_OPTION_SEEN="false"
 MODEL_ARG=""
 EFFORT_ARG=""
+LOGIN_DIR="${CLAUDE_SECOND_OPINION_CONFIG_DIR:-}"
+LOGIN_DIR_OPTION_SEEN="false"
 CONFIG_ARG="{{args}}"
 if [ -n "$CONFIG_ARG" ]; then
-  set -- $CONFIG_ARG
+  # Split on spaces the same way in sh, bash and zsh (zsh doesn't split a plain $VAR).
+  set -- $(printf '%s\n' "$CONFIG_ARG")
   for ARG in "$@"; do
     case "$ARG" in
+      --config-dir=*)
+        if [ "$LOGIN_DIR_OPTION_SEEN" = "true" ]; then
+          printf 'Duplicate claude-second-opinion option: --config-dir\nSpecify --config-dir at most once.\n' >&2
+          exit 2
+        fi
+        LOGIN_DIR="${ARG#--config-dir=}"
+        LOGIN_DIR_OPTION_SEEN="true"
+        ;;
       --fast)
         if [ "$FAST_MODE_OPTION_SEEN" = "true" ]; then
           printf 'Duplicate claude-second-opinion option: %s\nSpecify --fast at most once.\n' "$ARG" >&2
@@ -271,7 +284,7 @@ if [ -n "$CONFIG_ARG" ]; then
         FAST_MODE_OPTION_SEEN="true"
         ;;
       --*)
-        printf 'Unsupported claude-second-opinion option: %s\nSupported option: --fast.\n' "$ARG" >&2
+        printf 'Unsupported claude-second-opinion option: %s\nSupported options: --fast, --config-dir=<folder>.\n' "$ARG" >&2
         exit 2
         ;;
       *)
@@ -355,6 +368,30 @@ case "$CLAUDE_SECOND_OPINION_MODE" in
     exit 2
     ;;
 esac
+
+# Optional: run the reviewer on one saved Claude login, and only that login.
+if [ -n "$LOGIN_DIR" ]; then
+  case "$LOGIN_DIR" in
+    "~") LOGIN_DIR="$HOME" ;;
+    "~/"*) LOGIN_DIR="$HOME/${LOGIN_DIR#"~/"}" ;;
+  esac
+  if [ "$CLAUDE_SECOND_OPINION_MODE" = "bare" ]; then
+    printf '%s\n' "--config-dir names a saved subscription login; it can't be combined with CLAUDE_SECOND_OPINION_MODE=bare." >&2
+    exit 2
+  fi
+  if [ ! -d "$LOGIN_DIR" ]; then
+    printf 'No Claude settings folder at %s. Name the folder of an existing, signed-in Claude Code login.\n' "$LOGIN_DIR" >&2
+    exit 2
+  fi
+  # Credentials in the environment would override the folder's login.
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+  export CLAUDE_CONFIG_DIR="$LOGIN_DIR"
+  if ! LOGIN_STATUS="$("$CLAUDE_BIN" auth status 2>&1)"; then
+    printf 'The Claude login in %s is not signed in, so the review did not run:\n%s\n' "$LOGIN_DIR" "$LOGIN_STATUS" >&2
+    exit 4
+  fi
+  printf 'Reviewer login (%s):\n%s\n' "$LOGIN_DIR" "$LOGIN_STATUS" >&2
+fi
 
 if [ "$SCENARIO" = "independent-rca" ]; then
   PROMPT="Read the review packet from stdin. You are performing an independent root-cause analysis. The packet contains only the user transcript and a pointer to the repository — do NOT treat it as containing a prior analysis. If the packet references image files, read them with the Read tool. Inspect the repository directly using your allowed tools. Return: your root-cause hypothesis, supporting evidence from the codebase, suggested fix approach, confidence level, and any questions for the user that would help narrow the diagnosis."
